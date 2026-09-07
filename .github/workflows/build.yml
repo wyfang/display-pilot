@@ -12,10 +12,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Type-check
-        run: xcrun swiftc -typecheck -framework AppKit -framework CoreGraphics DisplayPilot.swift
+        run: >-
+          xcrun swiftc -typecheck -target "$(uname -m)-apple-macosx13.0"
+          -framework AppKit -framework CoreGraphics -framework ServiceManagement
+          DisplayCore.swift BetterDisplayBridge.swift PresetApplication.swift DisplayPilot.swift
+
+      - name: Run tests
+        run: ./Tests/run.sh
 
       - name: Build app
         run: ./build.sh
 
       - name: Verify signature
         run: codesign --verify --deep --strict "dist/Display Pilot.app"
+
+      - name: Verify minimum macOS version
+        run: |
+          binary="dist/Display Pilot.app/Contents/MacOS/DisplayPilot"
+          minimum_version="$(xcrun vtool -show-build "$binary" | awk '$1 == "minos" { print $2 }')"
+          test "$minimum_version" = "13.0"
