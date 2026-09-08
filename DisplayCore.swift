@@ -158,17 +158,40 @@ protocol DisplayBackend {
     func snapshots(includeModes: Bool) -> [DisplayInfo]
     func resolve(identity: String, includeModes: Bool) -> DisplayInfo?
     func resolveLegacy(identity: String, candidateID: CGDirectDisplayID, includeModes: Bool) -> DisplayInfo?
+    func resolveRemembered(_ record: StoredDisplay, includeModes: Bool) -> DisplayInfo?
     func setEnabled(_ enabled: Bool, display: DisplayInfo) -> Result<Void, AppFailure>
     func setModes(_ requests: [(mode: DisplayModeInfo, identity: String)]) -> [String: AppFailure]
 }
 
 extension DisplayBackend {
     func resolveLegacy(identity: String, candidateID: CGDirectDisplayID, includeModes: Bool) -> DisplayInfo? { nil }
+    func resolveRemembered(_ record: StoredDisplay, includeModes: Bool) -> DisplayInfo? { nil }
 }
 
 /// Legacy unit numbers were transient. Nonzero serials (or the sole built-in
 /// screen) can be migrated when unambiguous; serial-zero external records cannot.
 enum DisplayIdentity {
+    /// CoreGraphics uses the four-character codes "unkn" / "virt" for
+    /// anonymous virtual displays. They are not physical preset targets.
+    static func isAnonymousVirtual(_ identity: String?) -> Bool {
+        guard let identity else { return false }
+        return normalizedLegacy(identity) == "external-1970170734-1986622068-0"
+    }
+
+    static func ignoredVirtualIdentities(defaults: PreferenceStorage, displays: [DisplayInfo]) -> Set<String> {
+        var identities = Set(displays.filter { isAnonymousVirtual($0.legacyIdentity) }.map(\.identity))
+        // Earlier cache keys are retained as migration backups and also identify
+        // virtual entries already copied into the old presets.
+        for key in ["knownDisplaysV3", "knownDisplaysV2", "knownDisplaysV1"] {
+            guard let data = defaults.data(forKey: key),
+                  let records = try? JSONDecoder().decode([StoredDisplay].self, from: data) else { continue }
+            for record in records where isAnonymousVirtual(record.legacyIdentity ?? record.identity) {
+                identities.insert(record.identity)
+            }
+        }
+        return identities
+    }
+
     static func normalizedLegacy(_ identity: String) -> String {
         let identity = identity.hasPrefix("hardware:") ? String(identity.dropFirst(9)) : identity
         let parts = identity.split(separator: "-", omittingEmptySubsequences: false)
@@ -180,6 +203,28 @@ enum DisplayIdentity {
         let parts = normalizedLegacy(identity).split(separator: "-")
         guard parts.count == 4 else { return false }
         return parts[0] == "builtin" || (parts[0] == "external" && UInt32(parts[3]).map { $0 != 0 } == true)
+    }
+
+    /// Disabling a physical screen can remove both Quartz UUID mappings while
+    /// its framebuffer still reports the complete hardware identity. A cached
+    /// number is only a lookup hint for these freshly read, nonzero identifiers.
+    static func canRecoverRemembered(_ record: StoredDisplay, candidate: DisplayInfo,
+                                     mappedID: CGDirectDisplayID, online: [DisplayInfo]) -> Bool {
+        guard record.identity.hasPrefix("uuid:"),
+              UUID(uuidString: String(record.identity.dropFirst(5))) != nil,
+              let expected = record.legacyIdentity.map(normalizedLegacy),
+              record.id != 0, candidate.id == record.id,
+              candidate.builtin == record.builtin, !candidate.active, candidate.canControl,
+              candidate.legacyIdentity.map(normalizedLegacy) == expected,
+              mappedID == 0 || mappedID == candidate.id,
+              candidate.identity == record.identity || candidate.identity == "hardware:" + expected else { return false }
+        let parts = expected.split(separator: "-")
+        guard parts.count == 4, parts[0] == (record.builtin ? "builtin" : "external"),
+              parts.dropFirst().allSatisfy({ UInt32($0).map { $0 != 0 } == true }) else { return false }
+        return online.allSatisfy {
+            $0.id != candidate.id && $0.identity != record.identity
+                && $0.legacyIdentity.map(normalizedLegacy) != expected
+        }
     }
 
     static func protectConflicts(_ displays: [DisplayInfo]) -> [DisplayInfo] {
@@ -207,7 +252,7 @@ enum DisplayIdentity {
 final class DisplayController {
     private let defaults: PreferenceStorage
     private let backend: DisplayBackend
-    private let storageKey = "knownDisplaysV2"
+    private let storageKey = "knownDisplaysV3"
 
     init(defaults: PreferenceStorage = UserDefaults.standard, backend: DisplayBackend = QuartzDisplayBackend()) {
         self.defaults = defaults
@@ -215,8 +260,8 @@ final class DisplayController {
     }
 
     func displays(includeModes: Bool = true) -> [DisplayInfo] {
-        var online = backend.snapshots(includeModes: includeModes)
-        let previous = loadStoredDisplays()
+        var online = backend.snapshots(includeModes: includeModes).filter { !DisplayIdentity.isAnonymousVirtual($0.legacyIdentity) }
+        let previous = loadStoredDisplays().filter { !DisplayIdentity.isAnonymousVirtual($0.legacyIdentity ?? $0.identity) }
         // On the first upgrade, a software-disabled screen may have only a
         // legacy record. Its old ID is a lookup hint, accepted only after the
         // nonzero hardware identity and a UUID round trip have both been checked.
@@ -254,7 +299,7 @@ final class DisplayController {
         var seen = onlineIdentities
         let remembered = stored.compactMap { record -> DisplayInfo? in
             guard seen.insert(record.identity).inserted else { return nil }
-            if let resolved = backend.resolve(identity: record.identity, includeModes: includeModes),
+            if let resolved = resolveDisplay(identity: record.identity, includeModes: includeModes),
                resolved.identity == record.identity, resolved.canControl {
                 return DisplayInfo(id: resolved.id, name: record.name, active: resolved.active, builtin: resolved.builtin,
                                    identity: resolved.identity, currentMode: resolved.currentMode,
@@ -271,8 +316,18 @@ final class DisplayController {
     }
 
     func resolveDisplay(identity: String, includeModes: Bool = false) -> DisplayInfo? {
-        guard let display = backend.resolve(identity: identity, includeModes: includeModes),
-              display.identity == identity, display.canControl else { return nil }
+        let direct = backend.resolve(identity: identity, includeModes: includeModes)
+        let records = loadStoredDisplays()
+        let matching = records.filter { $0.identity == identity }
+        var recovered: DisplayInfo?
+        if direct == nil, matching.count == 1, let record = matching.first,
+           let hardware = record.legacyIdentity.map(DisplayIdentity.normalizedLegacy),
+           records.allSatisfy({ $0.identity == identity || DisplayIdentity.normalizedLegacy($0.legacyIdentity ?? $0.identity) != hardware }) {
+            recovered = backend.resolveRemembered(record, includeModes: includeModes)
+        }
+        guard let display = direct ?? recovered,
+              display.identity == identity, display.canControl,
+              !DisplayIdentity.isAnonymousVirtual(display.legacyIdentity) else { return nil }
         return display
     }
 
@@ -301,7 +356,7 @@ final class DisplayController {
 
     private func loadStoredDisplays() -> [StoredDisplay] {
         // Keep the old key intact as a migration backup.
-        for key in [storageKey, "knownDisplaysV1"] {
+        for key in [storageKey, "knownDisplaysV2", "knownDisplaysV1"] {
             if let data = defaults.data(forKey: key),
                let displays = try? JSONDecoder().decode([StoredDisplay].self, from: data) { return displays }
         }
@@ -316,7 +371,7 @@ struct QuartzDisplayBackend: DisplayBackend {
         var ids = Array(repeating: CGDirectDisplayID(), count: Int(count))
         guard CGGetOnlineDisplayList(count, &ids, &count) == .success else { return [] }
         let raw = ids.prefix(Int(count)).map { snapshot(id: $0, includeModes: includeModes) }
-        return DisplayIdentity.protectConflicts(raw)
+        return DisplayIdentity.protectConflicts(raw.filter { !DisplayIdentity.isAnonymousVirtual($0.legacyIdentity) })
     }
 
     func resolve(identity: String, includeModes: Bool) -> DisplayInfo? {
@@ -336,7 +391,8 @@ struct QuartzDisplayBackend: DisplayBackend {
         // Software-disabled displays can disappear from the online list. Quartz's
         // UUID round trip verifies the current address before reconnecting them.
         let display = snapshot(id: id, includeModes: includeModes)
-        return display.identity == identity && display.canControl ? display : nil
+        return display.identity == identity && display.canControl
+            && !DisplayIdentity.isAnonymousVirtual(display.legacyIdentity) ? display : nil
     }
 
     func resolveLegacy(identity: String, candidateID: CGDirectDisplayID, includeModes: Bool) -> DisplayInfo? {
@@ -351,10 +407,25 @@ struct QuartzDisplayBackend: DisplayBackend {
         return resolved
     }
 
+    func resolveRemembered(_ record: StoredDisplay, includeModes: Bool) -> DisplayInfo? {
+        guard record.id != kCGNullDirectDisplay,
+              record.identity.hasPrefix("uuid:"),
+              let uuid = CFUUIDCreateFromString(nil, String(record.identity.dropFirst(5)) as CFString) else { return nil }
+        let online = snapshots(includeModes: false)
+        let candidate = snapshot(id: record.id, includeModes: includeModes)
+        guard CGDisplayIsOnline(record.id) == 0,
+              DisplayIdentity.canRecoverRemembered(record, candidate: candidate,
+                  mappedID: CGDisplayGetDisplayIDFromUUID(uuid), online: online) else { return nil }
+        return DisplayInfo(id: candidate.id, name: record.name, active: false, builtin: candidate.builtin,
+                           identity: record.identity, currentMode: nil, availableModes: [],
+                           legacyIdentity: candidate.legacyIdentity, canControl: true)
+    }
+
     func setEnabled(_ enabled: Bool, display: DisplayInfo) -> Result<Void, AppFailure> {
         // Re-resolve immediately before the transaction: hotplug may recycle IDs
         // between the menu snapshot and this call.
-        guard let current = resolve(identity: display.identity, includeModes: false) else {
+        guard let current = resolve(identity: display.identity, includeModes: false)
+                ?? (enabled ? resolveRemembered(StoredDisplay(display), includeModes: false) : nil) else {
             return .failure(AppFailure(message: "显示器连接已变化，无法安全切换，请刷新后重试。"))
         }
         if current.active == enabled { return .success(()) }
@@ -366,7 +437,9 @@ struct QuartzDisplayBackend: DisplayBackend {
         guard begin == .success, let config else {
             return .failure(AppFailure(message: "无法开始修改显示器配置（错误 \(begin.rawValue)）。"))
         }
-        guard uuidOrHardwareIdentity(current.id) == current.identity else {
+        guard let verified = resolve(identity: current.identity, includeModes: false)
+                ?? (enabled ? resolveRemembered(StoredDisplay(current), includeModes: false) : nil),
+              verified.id == current.id else {
             CGCancelDisplayConfiguration(config)
             return .failure(AppFailure(message: "显示器身份已变化，已取消切换。"))
         }
@@ -482,7 +555,7 @@ struct QuartzDisplayBackend: DisplayBackend {
 
 final class PresetStore {
     private let defaults: PreferenceStorage
-    private let storageKey = "displayPresetsV3"
+    private let storageKey = "displayPresetsV4"
 
     init(defaults: PreferenceStorage = UserDefaults.standard) { self.defaults = defaults }
 
@@ -493,6 +566,10 @@ final class PresetStore {
             presetB: DisplayPreset(name: "预设 B", displays: [])
         )
         let original = collection
+        let ignored = DisplayIdentity.ignoredVirtualIdentities(defaults: defaults, displays: displays)
+        collection.presetA.displays.removeAll { ignored.contains($0.identity) || DisplayIdentity.isAnonymousVirtual($0.identity) }
+        collection.presetB.displays.removeAll { ignored.contains($0.identity) || DisplayIdentity.isAnonymousVirtual($0.identity) }
+        let displays = displays.filter { !ignored.contains($0.identity) && !DisplayIdentity.isAnonymousVirtual($0.legacyIdentity) }
         migrateLegacyIdentities(&collection.presetA, displays: displays)
         migrateLegacyIdentities(&collection.presetB, displays: displays)
         synchronize(&collection.presetA, with: displays, defaultBrightness: legacyBrightness("presetA", fallback: 0.35))
@@ -508,7 +585,7 @@ final class PresetStore {
 
     private func loadStoredCollection() -> PresetCollection? {
         // Old keys remain byte-for-byte intact to make this migration reversible.
-        for key in [storageKey, "displayPresetsV2", "displayPresetsV1"] {
+        for key in [storageKey, "displayPresetsV3", "displayPresetsV2", "displayPresetsV1"] {
             if let data = defaults.data(forKey: key),
                let value = try? JSONDecoder().decode(PresetCollection.self, from: data) { return value }
         }

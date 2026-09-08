@@ -12,6 +12,8 @@ private final class CoreFakeBackend: DisplayBackend {
     var online: [DisplayInfo] = []
     var resolved: [String: DisplayInfo] = [:]
     var legacyResolved: [UInt32: DisplayInfo] = [:]
+    var rememberedResolved: [String: DisplayInfo] = [:]
+    var rememberedCalls: [StoredDisplay] = []
     var enabledCalls: [(Bool, String, UInt32)] = []
     var modeCalls: [(DisplayModeInfo, String)] = []
     var modeEnumerationCount = 0
@@ -25,6 +27,10 @@ private final class CoreFakeBackend: DisplayBackend {
     }
     func resolveLegacy(identity: String, candidateID: UInt32, includeModes: Bool) -> DisplayInfo? {
         legacyResolved[candidateID]
+    }
+    func resolveRemembered(_ record: StoredDisplay, includeModes: Bool) -> DisplayInfo? {
+        rememberedCalls.append(record)
+        return rememberedResolved[record.identity]
     }
     func setEnabled(_ enabled: Bool, display: DisplayInfo) -> Result<Void, AppFailure> {
         enabledCalls.append((enabled, display.identity, display.id))
@@ -68,7 +74,7 @@ struct DisplayCoreTests {
             if case .success = controller.setEnabled(true, identity: "uuid:old") { throw CoreTestFailure(message: "stale ID accepted") }
             try coreExpect(backend.enabledCalls.isEmpty, "reused ID must never reach hardware")
             try coreExpect(defaults.data(forKey: "knownDisplaysV1") == oldData, "legacy cache backup unchanged")
-            let stored = try JSONDecoder().decode([StoredDisplay].self, from: defaults.data(forKey: "knownDisplaysV2")!)
+            let stored = try JSONDecoder().decode([StoredDisplay].self, from: defaults.data(forKey: "knownDisplaysV3")!)
             try coreExpect(Set(stored.map(\.identity)) == ["uuid:old", "uuid:new"], "ID reuse must not overwrite another identity")
         }
         // A software-disabled screen can be reconnected through a verified UUID
@@ -184,6 +190,120 @@ struct DisplayCoreTests {
             let result = DisplayController(defaults: defaults, backend: backend).setModes([(coreMode, "uuid:missing"), (coreMode, "uuid:a")])
             try coreExpect(result["uuid:missing"] != nil && backend.modeCalls.count == 1 && backend.modeCalls[0].1 == "uuid:a", "mode commands also resolve the identity first")
         }
-        print("DisplayCore: 11 regression scenarios passed")
+        // Anonymous system virtual screens must not become permanent preset
+        // targets. Match hardware metadata, never a user-visible name or an ID.
+        do {
+            let defaults = CoreMemoryPreferences(); let backend = CoreFakeBackend()
+            let physical = coreScreen(4, "uuid:physical")
+            let virtual = coreScreen(14, "uuid:virtual", legacy: "external-1970170734-1986622068-0")
+            backend.online = [physical, virtual]
+            let oldCache = try JSONEncoder().encode([StoredDisplay(physical), StoredDisplay(virtual)])
+            defaults.values["knownDisplaysV2"] = oldCache
+            var physicalEntry = coreEntry(physical.identity, brightness: 0.5348591549295775)
+            physicalEntry.name = physical.name
+            let original = PresetCollection(presetA: DisplayPreset(name: "工作模式", displays: [physicalEntry, coreEntry(virtual.identity)]),
+                                            presetB: DisplayPreset(name: "息屏模式", displays: [physicalEntry, coreEntry(virtual.identity)]))
+            let oldPresets = try JSONEncoder().encode(original)
+            defaults.values["displayPresetsV3"] = oldPresets
+            let controller = DisplayController(defaults: defaults, backend: backend)
+            let screens = controller.displays(includeModes: false)
+            try coreExpect(screens.map(\.identity) == [physical.identity], "virtual screen excluded while online")
+            if case .success = controller.setEnabled(true, identity: virtual.identity) { throw CoreTestFailure(message: "virtual target was controllable") }
+            try coreExpect(backend.enabledCalls.isEmpty, "virtual screen never receives commands")
+            let store = PresetStore(defaults: defaults)
+            let result = store.load(displays: screens)
+            try coreExpect(result.presetA.displays == [physicalEntry] && result.presetB.displays == [physicalEntry], "ghost target removed without changing physical settings")
+            try coreExpect(defaults.data(forKey: "knownDisplaysV2") == oldCache && defaults.data(forKey: "displayPresetsV3") == oldPresets, "previous cache and presets remain byte-identical")
+            backend.online = [physical]
+            try coreExpect(controller.displays(includeModes: false).count == 1, "offline virtual record does not return")
+            try coreExpect(store.load(displays: screens) == result, "migration is idempotent")
+            try coreExpect(!DisplayIdentity.isAnonymousVirtual("external-1970170734-1986622068-123"), "nonzero-serial virtual displays are not guessed to be anonymous")
+        }
+        // Unknown/offline physical screens remain recoverable even when their
+        // visible name is identical to the system's anonymous virtual display.
+        do {
+            let defaults = CoreMemoryPreferences(); let backend = CoreFakeBackend()
+            let old = StoredDisplay(id: 14, name: "未知显示器", builtin: false, identity: "uuid:real", legacyIdentity: "external-10-20-0")
+            defaults.values["knownDisplaysV2"] = try JSONEncoder().encode([old])
+            let screens = DisplayController(defaults: defaults, backend: backend).displays(includeModes: false)
+            try coreExpect(screens.count == 1 && screens[0].identity == old.identity, "physical offline record retained regardless of name")
+            let entry = coreEntry(old.identity)
+            let collection = PresetCollection(presetA: DisplayPreset(name: "A", displays: [entry]), presetB: DisplayPreset(name: "B", displays: [entry]))
+            defaults.values["displayPresetsV3"] = try JSONEncoder().encode(collection)
+            try coreExpect(PresetStore(defaults: defaults).load(displays: screens) == collection, "unresolved physical preset is never silently ignored")
+        }
+        // A pre-UUID virtual cache can already be offline at first launch.
+        do {
+            let defaults = CoreMemoryPreferences(); let backend = CoreFakeBackend()
+            let virtualID = "external-1970170734-1986622068-0-14"
+            let realID = "external-10-20-123-4"
+            let cache = try JSONEncoder().encode([
+                StoredDisplay(id: 14, name: "未知显示器", builtin: false, identity: virtualID),
+                StoredDisplay(id: 4, name: "Real offline", builtin: false, identity: realID)
+            ])
+            defaults.values["knownDisplaysV1"] = cache
+            let realEntry = coreEntry(realID)
+            let original = PresetCollection(presetA: DisplayPreset(name: "A", displays: [coreEntry(virtualID), realEntry]),
+                                            presetB: DisplayPreset(name: "B", displays: [coreEntry(virtualID), realEntry]))
+            let presetData = try JSONEncoder().encode(original)
+            defaults.values["displayPresetsV1"] = presetData
+            let screens = DisplayController(defaults: defaults, backend: backend).displays(includeModes: false)
+            let migrated = PresetStore(defaults: defaults).load(displays: screens)
+            try coreExpect(screens.map(\.identity) == [realID], "offline pre-UUID virtual cache is excluded")
+            try coreExpect(migrated.presetA.displays == [realEntry] && migrated.presetB.displays == [realEntry], "legacy virtual preset excluded while physical offline settings survive")
+            try coreExpect(defaults.data(forKey: "knownDisplaysV1") == cache && defaults.data(forKey: "displayPresetsV1") == presetData, "pre-UUID backups remain untouched")
+        }
+        // A real software disconnect removes both Quartz UUID mappings while
+        // leaving nonzero vendor/model/serial metadata at the old framebuffer.
+        do {
+            let identity = "uuid:11111111-2222-4333-8444-555555555555"
+            let hardware = "external-1234-5678-987654"
+            let record = StoredDisplay(id: 4, name: "Saved display", builtin: false,
+                                       identity: identity, legacyIdentity: hardware)
+            let candidate = coreScreen(4, "hardware:" + hardware, legacy: hardware, active: false)
+            let spare = coreScreen(1, "uuid:spare", legacy: "external-10-20-123")
+            func accepts(_ candidate: DisplayInfo, mappedID: UInt32 = 0, online: [DisplayInfo]? = nil) -> Bool {
+                DisplayIdentity.canRecoverRemembered(record, candidate: candidate, mappedID: mappedID, online: online ?? [spare])
+            }
+            try coreExpect(accepts(candidate), "known UUID binding recovers when both UUID mappings vanish")
+            try coreExpect(!accepts(coreScreen(0, "hardware:" + hardware, legacy: hardware, active: false)), "zero ID never reaches recovery")
+            try coreExpect(!accepts(coreScreen(4, "uuid:other", legacy: hardware, active: false)), "explicit UUID mismatch overrides matching hardware")
+            try coreExpect(!accepts(candidate, mappedID: 19), "UUID mapping to another ID blocks recovery")
+            try coreExpect(!accepts(coreScreen(4, "hardware:external-1234-5678-111", legacy: "external-1234-5678-111", active: false)), "changed serial blocks recovery")
+            try coreExpect(!accepts(coreScreen(4, "hardware:" + hardware, legacy: hardware)), "active candidates never use offline fallback")
+            try coreExpect(!accepts(candidate, online: [coreScreen(4, "uuid:new")]), "reused online ID blocks recovery")
+            try coreExpect(!accepts(candidate, online: [coreScreen(19, "uuid:twin", legacy: hardware)]), "online hardware collision blocks recovery")
+            for incompleteHardware in ["external-1234-5678-0", "external-0-5678-123", "external-1234-0-123"] {
+                let incomplete = StoredDisplay(id: 4, name: "Incomplete", builtin: false, identity: identity, legacyIdentity: incompleteHardware)
+                let current = coreScreen(4, "hardware:" + incompleteHardware, legacy: incompleteHardware, active: false)
+                try coreExpect(!DisplayIdentity.canRecoverRemembered(incomplete, candidate: current, mappedID: 0, online: []), "all three hardware identifiers must be nonzero")
+            }
+        }
+        // Reconnecting through the controller preserves the saved UUID and
+        // refuses cached bindings shared by another remembered display.
+        do {
+            let defaults = CoreMemoryPreferences(); let backend = CoreFakeBackend()
+            let identity = "uuid:11111111-2222-4333-8444-555555555555"
+            let hardware = "external-1234-5678-987654"
+            let record = StoredDisplay(id: 4, name: "Saved display", builtin: false, identity: identity, legacyIdentity: hardware)
+            defaults.values["knownDisplaysV3"] = try JSONEncoder().encode([record])
+            backend.online = [coreScreen(1, "uuid:spare", legacy: "external-10-20-123")]
+            backend.rememberedResolved[identity] = coreScreen(4, identity, legacy: hardware, active: false)
+            let controller = DisplayController(defaults: defaults, backend: backend)
+            let listed = controller.displays(includeModes: false).first { $0.identity == identity }
+            try coreExpect(listed?.id == 4 && listed?.canControl == true, "software-disconnected screen remains available in menu")
+            _ = controller.setEnabled(true, identity: identity)
+            try coreExpect(backend.enabledCalls.count == 1 && backend.enabledCalls[0].2 == 4, "verified remembered binding reaches reconnect")
+            let twin = StoredDisplay(id: 19, name: "Twin", builtin: false, identity: "uuid:other", legacyIdentity: hardware)
+            defaults.values["knownDisplaysV3"] = try JSONEncoder().encode([record, twin])
+            let calls = backend.rememberedCalls.count
+            _ = controller.setEnabled(true, identity: identity)
+            try coreExpect(backend.enabledCalls.count == 1 && backend.rememberedCalls.count == calls, "ambiguous remembered hardware never reaches recovery backend")
+            defaults.values["knownDisplaysV3"] = try JSONEncoder().encode([record])
+            backend.rememberedResolved[identity] = coreScreen(4, "uuid:wrong", legacy: hardware, active: false)
+            _ = controller.setEnabled(true, identity: identity)
+            try coreExpect(backend.enabledCalls.count == 1, "recovery result still must match requested UUID")
+        }
+        print("DisplayCore: 16 regression scenarios passed")
     }
 }

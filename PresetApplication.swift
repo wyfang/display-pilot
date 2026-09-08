@@ -65,7 +65,12 @@ final class PresetApplication {
         let targets = context.preset.displays.filter(\.enabled)
         let resolved = targets.compactMap { entry in displays.first { $0.identity == entry.identity && $0.active } }
         let ready = resolved.count == targets.count && targets.allSatisfy { entry in
-            entry.mode == nil || resolved.contains { $0.identity == entry.identity && !$0.availableModes.isEmpty }
+            guard let requested = entry.mode else { return true }
+            return resolved.contains {
+                $0.identity == entry.identity
+                    && ($0.currentMode?.describesSameMode(as: requested) == true
+                        || requested.matchingMode(in: $0.availableModes) != nil)
+            }
         }
         let currentSignature = resolved.sorted { $0.identity < $1.identity }.map { display in
             let modes = display.availableModes.map { "\($0.modeID):\($0.label):\($0.pixelWidth)x\($0.pixelHeight)" }.sorted().joined(separator: ",")
@@ -89,11 +94,17 @@ final class PresetApplication {
 
     private func applyModes(_ context: Context, attempt: Int) {
         connectTargets(context)
-        let displays = dependencies.displays(false)
+        let displays = dependencies.displays(true)
         let requests: [(mode: DisplayModeInfo, identity: String)] = context.preset.displays.compactMap { entry in
             guard entry.enabled, let requested = entry.mode,
                   let display = displays.first(where: { $0.identity == entry.identity && $0.active }),
                   display.currentMode?.describesSameMode(as: requested) != true else { return nil }
+            // Reconnection can initially expose only a partial mode list. Keep
+            // waiting for the saved mode instead of applying an approximate one.
+            guard requested.matchingMode(in: display.availableModes) != nil else {
+                context.modeFailures[entry.identity] = "找不到完全匹配的已保存分辨率 \(requested.label)，未改用其它缩放或刷新率。"
+                return nil
+            }
             return (requested, entry.identity)
         }
         let failures = dependencies.setModes(requests)
@@ -146,13 +157,21 @@ final class PresetApplication {
     }
 
     private func disableUnwanted(_ context: Context, attempt: Int) {
-        // Recheck the intended remaining screen before each destructive operation.
+        // Keep every currently useful screen until all intended targets and their
+        // saved modes have recovered. Recheck after each topology change.
         let unwanted = context.preset.displays.filter { !$0.enabled }
         for entry in unwanted {
             let displays = dependencies.displays(false)
-            guard context.preset.displays.contains(where: { target in
-                target.enabled && displays.contains { $0.identity == target.identity && $0.active }
-            }) else { finish(context); return }
+            guard context.preset.displays.filter(\.enabled).allSatisfy({ target in
+                guard let display = displays.first(where: { $0.identity == target.identity && $0.active }) else { return false }
+                return target.mode.map { display.currentMode?.describesSameMode(as: $0) == true } ?? true
+            }) else {
+                for retained in unwanted where displays.contains(where: { $0.identity == retained.identity && $0.active }) {
+                    context.disableFailures[retained.identity] = "目标显示器及其分辨率尚未全部恢复，已暂缓断开以保留可用屏幕。"
+                }
+                performVisual(context, verify: true) { [weak self] in self?.finish(context) }
+                return
+            }
             guard displays.contains(where: { $0.identity == entry.identity && $0.active }) else { continue }
             switch dependencies.setEnabled(false, entry.identity) {
             case .success: context.disableFailures.removeValue(forKey: entry.identity)

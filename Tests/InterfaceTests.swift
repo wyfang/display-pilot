@@ -38,11 +38,11 @@ private enum InterfaceTests {
         controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: nameField))
         controller.present()
         precondition(nameField.stringValue == "Unsaved draft", "reopening visible settings preserves draft")
-        let before = memory.data(forKey: "displayPresetsV3")
+        let before = memory.data(forKey: "displayPresetsV4")
         controller.canSave = { false }
         let save = descendants(controller.window!.contentView!).compactMap { $0 as? NSButton }.first { $0.title == "保存" }!
         _ = save.sendAction(save.action, to: save.target)
-        precondition(memory.data(forKey: "displayPresetsV3") == before, "save handler enforces operation lock")
+        precondition(memory.data(forKey: "displayPresetsV4") == before, "save handler enforces operation lock")
         controller.setSavingEnabled(false)
         precondition(!save.isEnabled)
         controller.window?.close()
