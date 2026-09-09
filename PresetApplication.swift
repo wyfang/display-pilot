@@ -5,6 +5,7 @@ import CoreGraphics
 /// Dependencies keep retries testable without changing physical displays or preferences.
 final class PresetApplication {
     typealias VisualOperation = (Double, Double, CGDirectDisplayID, @escaping (Result<Void, AppFailure>) -> Void) -> Void
+    typealias RotationOperation = (Int, String, @escaping (Result<Void, AppFailure>) -> Void) -> Void
     struct Dependencies {
         var displays: (Bool) -> [DisplayInfo]
         var setEnabled: (Bool, String) -> Result<Void, AppFailure>
@@ -12,6 +13,9 @@ final class PresetApplication {
         var setVisual: VisualOperation
         var verifyVisual: VisualOperation
         var schedule: (TimeInterval, @escaping () -> Void) -> Void
+        var setRotation: RotationOperation = { _, _, completion in
+            completion(.failure(AppFailure(message: "当前环境不支持旋转显示器。")))
+        }
     }
 
     private final class Context {
@@ -19,6 +23,11 @@ final class PresetApplication {
         let completion: ([String]) -> Void
         var enableFailures: [String: String] = [:]
         var modeFailures: [String: String] = [:]
+        var rotationFailures: [String: String] = [:]
+        var learnedRotations: [String: Int] = [:]
+        var disconnected: Set<String> = []
+        var afterDisconnect = false
+        var stoppedBeforeVisual = false
         var disableFailures: [String: String] = [:]
         var visualFailures: [String: String] = [:]
         var verifiedIDs: [String: CGDirectDisplayID] = [:]
@@ -65,7 +74,9 @@ final class PresetApplication {
         let targets = context.preset.displays.filter(\.enabled)
         let resolved = targets.compactMap { entry in displays.first { $0.identity == entry.identity && $0.active } }
         let ready = resolved.count == targets.count && targets.allSatisfy { entry in
-            guard let requested = entry.mode else { return true }
+            if let angle = entry.requestedRotation ?? context.learnedRotations[entry.identity],
+               resolved.contains(where: { $0.identity == entry.identity && $0.rotation != angle }) { return true }
+            guard let requested = entry.requestedMode else { return true }
             return resolved.contains {
                 $0.identity == entry.identity
                     && ($0.currentMode?.describesSameMode(as: requested) == true
@@ -74,7 +85,7 @@ final class PresetApplication {
         }
         let currentSignature = resolved.sorted { $0.identity < $1.identity }.map { display in
             let modes = display.availableModes.map { "\($0.modeID):\($0.label):\($0.pixelWidth)x\($0.pixelHeight)" }.sorted().joined(separator: ",")
-            return "\(display.identity):\(display.id):\(display.currentMode?.modeID ?? -1):\(modes)"
+            return "\(display.identity):\(display.id):\(display.rotation ?? -1):\(display.currentMode?.modeID ?? -1):\(modes)"
         }.joined(separator: "|")
         let nextCount = ready ? (signature == currentSignature ? stableCount + 1 : 1) : 0
         if ready && nextCount >= 3 {
@@ -85,7 +96,7 @@ final class PresetApplication {
                 self?.waitForTargets(context, attempt: attempt + 1, signature: ready ? currentSignature : nil, stableCount: nextCount)
             }
         } else if resolved.isEmpty {
-            finish(context)
+            stopBeforeVisual(context)
         } else {
             // A later retry can recover a slow connection. Only final validation emits errors.
             applyModes(context, attempt: 1)
@@ -94,9 +105,47 @@ final class PresetApplication {
 
     private func applyModes(_ context: Context, attempt: Int) {
         connectTargets(context)
+        applyRotations(context, entries: context.preset.displays.filter(\.enabled), index: 0) { [weak self] in
+            self?.configureModes(context, attempt: attempt)
+        }
+    }
+
+    private func applyRotations(_ context: Context, entries: [DisplayPresetEntry], index: Int, completion: @escaping () -> Void) {
+        guard index < entries.count else { completion(); return }
+        let entry = entries[index]
+        let next = { [weak self] in self?.applyRotations(context, entries: entries, index: index + 1, completion: completion) }
+        guard let display = dependencies.displays(false).first(where: { $0.identity == entry.identity && $0.active }) else { next(); return }
+        // Learn a legacy preset's direction only while its saved orientation is
+        // actually present; portrait dimensions cannot distinguish 90 from 270.
+        if entry.requestedRotation == nil, context.learnedRotations[entry.identity] == nil,
+           let requested = entry.requestedMode, let current = display.currentMode,
+           requested.hasSameOrientation(as: current), let angle = display.rotation {
+            context.learnedRotations[entry.identity] = angle
+        }
+        guard let angle = entry.requestedRotation ?? context.learnedRotations[entry.identity] else { next(); return }
+        guard display.rotation != angle else {
+            context.rotationFailures.removeValue(forKey: entry.identity)
+            next(); return
+        }
+        dependencies.setRotation(angle, entry.identity) { result in
+            switch result {
+            case .success: context.rotationFailures.removeValue(forKey: entry.identity)
+            case .failure(let error): context.rotationFailures[entry.identity] = error.message
+            }
+            next()
+        }
+    }
+
+    private func geometryMatches(_ entry: DisplayPresetEntry, display: DisplayInfo, context: Context) -> Bool {
+        let angle = entry.requestedRotation ?? context.learnedRotations[entry.identity]
+        return (angle == nil || display.rotation == angle)
+            && (entry.requestedMode.map { display.currentMode?.describesSameMode(as: $0) == true } ?? true)
+    }
+
+    private func configureModes(_ context: Context, attempt: Int) {
         let displays = dependencies.displays(true)
         let requests: [(mode: DisplayModeInfo, identity: String)] = context.preset.displays.compactMap { entry in
-            guard entry.enabled, let requested = entry.mode,
+            guard entry.enabled, let requested = entry.requestedMode,
                   let display = displays.first(where: { $0.identity == entry.identity && $0.active }),
                   display.currentMode?.describesSameMode(as: requested) != true else { return nil }
             // Reconnection can initially expose only a partial mode list. Keep
@@ -105,6 +154,8 @@ final class PresetApplication {
                 context.modeFailures[entry.identity] = "找不到完全匹配的已保存分辨率 \(requested.label)，未改用其它缩放或刷新率。"
                 return nil
             }
+            let angle = entry.requestedRotation ?? context.learnedRotations[entry.identity]
+            guard angle == nil || display.rotation == angle else { return nil }
             return (requested, entry.identity)
         }
         let failures = dependencies.setModes(requests)
@@ -115,20 +166,30 @@ final class PresetApplication {
             let pending = context.preset.displays.contains { entry in
                 guard entry.enabled else { return false }
                 guard let display = current.first(where: { $0.identity == entry.identity && $0.active }) else { return true }
-                return entry.mode.map { display.currentMode?.describesSameMode(as: $0) != true } ?? false
+                return !self.geometryMatches(entry, display: display, context: context)
             }
             if pending && attempt < 6 { self.applyModes(context, attempt: attempt + 1) }
-            else { self.applyVisual(context, pass: 1) }
+            else if pending { self.stopBeforeVisual(context) }
+            else if context.afterDisconnect { self.applyVisual(context, pass: 1) }
+            else { self.disableUnwanted(context, attempt: 1) }
         }
     }
 
     private func applyVisual(_ context: Context, pass: Int) {
+        let current = dependencies.displays(false)
+        guard context.preset.displays.filter(\.enabled).allSatisfy({ entry in
+            guard let display = current.first(where: { $0.identity == entry.identity && $0.active }) else { return false }
+            return geometryMatches(entry, display: display, context: context)
+        }) else { stopBeforeVisual(context); return }
         performVisual(context, verify: false) { [weak self] in
             guard let self else { return }
             if pass == 1 && !context.visualFailures.isEmpty {
                 self.dependencies.schedule(0.8) { [weak self] in self?.applyVisual(context, pass: 2) }
             } else {
-                self.dependencies.schedule(0.35) { [weak self] in self?.disableUnwanted(context, attempt: 1) }
+                self.dependencies.schedule(0.35) { [weak self] in
+                    guard let self else { return }
+                    self.performVisual(context, verify: true) { [weak self] in self?.finish(context) }
+                }
             }
         }
     }
@@ -156,25 +217,38 @@ final class PresetApplication {
         }
     }
 
+    private func stopBeforeVisual(_ context: Context) {
+        context.stoppedBeforeVisual = true
+        let displays = dependencies.displays(false)
+        for entry in context.preset.displays where !entry.enabled {
+            if context.disconnected.contains(entry.identity) {
+                // The target changed after a topology operation. Restore screens
+                // disconnected by this attempt before returning the error.
+                switch dependencies.setEnabled(true, entry.identity) {
+                case .success: context.disableFailures[entry.identity] = "目标显示器未就绪，已请求重新连接以保留可用屏幕。"
+                case .failure(let error): context.disableFailures[entry.identity] = "目标显示器未就绪，重新连接失败：" + error.message
+                }
+            } else if displays.contains(where: { $0.identity == entry.identity && $0.active }) {
+                context.disableFailures[entry.identity] = "目标显示器及其分辨率尚未全部恢复，已暂缓断开以保留可用屏幕。"
+            }
+        }
+        dependencies.schedule(context.disconnected.isEmpty ? 0 : 0.9) { [weak self] in self?.finish(context) }
+    }
+
     private func disableUnwanted(_ context: Context, attempt: Int) {
-        // Keep every currently useful screen until all intended targets and their
-        // saved modes have recovered. Recheck after each topology change.
         let unwanted = context.preset.displays.filter { !$0.enabled }
         for entry in unwanted {
             let displays = dependencies.displays(false)
+            // A topology change can rotate remaining targets. Their connections
+            // must survive; their exact geometry is restored after disconnection.
             guard context.preset.displays.filter(\.enabled).allSatisfy({ target in
-                guard let display = displays.first(where: { $0.identity == target.identity && $0.active }) else { return false }
-                return target.mode.map { display.currentMode?.describesSameMode(as: $0) == true } ?? true
-            }) else {
-                for retained in unwanted where displays.contains(where: { $0.identity == retained.identity && $0.active }) {
-                    context.disableFailures[retained.identity] = "目标显示器及其分辨率尚未全部恢复，已暂缓断开以保留可用屏幕。"
-                }
-                performVisual(context, verify: true) { [weak self] in self?.finish(context) }
-                return
-            }
+                displays.contains { $0.identity == target.identity && $0.active }
+            }) else { stopBeforeVisual(context); return }
             guard displays.contains(where: { $0.identity == entry.identity && $0.active }) else { continue }
             switch dependencies.setEnabled(false, entry.identity) {
-            case .success: context.disableFailures.removeValue(forKey: entry.identity)
+            case .success:
+                context.disconnected.insert(entry.identity)
+                context.disableFailures.removeValue(forKey: entry.identity)
             case .failure(let error): context.disableFailures[entry.identity] = error.message
             }
         }
@@ -183,13 +257,16 @@ final class PresetApplication {
             let displays = self.dependencies.displays(false)
             let remaining = unwanted.contains { entry in displays.contains { $0.identity == entry.identity && $0.active } }
             if remaining && attempt < 3 { self.disableUnwanted(context, attempt: attempt + 1) }
+            else if remaining { self.stopBeforeVisual(context) }
+            else if context.disconnected.isEmpty { self.applyVisual(context, pass: 1) }
             else {
-                self.performVisual(context, verify: true) { [weak self] in self?.finish(context) }
+                context.afterDisconnect = true
+                self.waitForTargets(context, attempt: 0, signature: nil, stableCount: 0)
             }
         }
     }
 
-    /// Names, ordering and an automatically learned mode are not user edits.
+    /// Names and ordering are metadata; explicit geometry choices are settings.
     static func settingsUnchanged(executed: DisplayPreset, saved: DisplayPreset) -> Bool {
         guard executed.name == saved.name, executed.displays.count == saved.displays.count else { return false }
         return executed.displays.allSatisfy { entry in
@@ -197,9 +274,14 @@ final class PresetApplication {
             guard matches.count == 1, let current = matches.first,
                   entry.enabled == current.enabled,
                   entry.brightness == current.brightness,
-                  entry.contrast == current.contrast else { return false }
-            if let mode = entry.mode { return current.mode?.describesSameMode(as: mode) == true }
-            return true
+                  entry.contrast == current.contrast,
+                  entry.rotation == current.rotation,
+                  entry.applyGeometry == current.applyGeometry else { return false }
+            switch (entry.mode, current.mode) {
+            case (nil, nil): return true
+            case let (mode?, other?): return mode.describesSameMode(as: other)
+            default: return false
+            }
         }
     }
 
@@ -208,7 +290,10 @@ final class PresetApplication {
             let display = displays.first { $0.identity == entry.identity && $0.active }
             if entry.enabled {
                 guard let display else { return "\(entry.name)：目标显示器未连接" }
-                if let mode = entry.mode, display.currentMode?.describesSameMode(as: mode) != true {
+                if let angle = entry.requestedRotation, display.rotation != angle {
+                    return "\(entry.name)：未恢复保存的旋转角度 \(angle)°"
+                }
+                if let mode = entry.requestedMode, display.currentMode?.describesSameMode(as: mode) != true {
                     return "\(entry.name)：未切换到保存的分辨率 \(mode.label)"
                 }
             } else if display != nil { return "\(entry.name)：显示器没有按预设断开" }
@@ -227,16 +312,22 @@ final class PresetApplication {
                     errors.append("\(entry.name)：\(context.enableFailures[entry.identity] ?? "目标显示器未连接")")
                     continue
                 }
-                if let mode = entry.mode, display.currentMode?.describesSameMode(as: mode) != true {
+                if let angle = entry.requestedRotation ?? context.learnedRotations[entry.identity], display.rotation != angle {
+                    errors.append("\(entry.name)：\(context.rotationFailures[entry.identity] ?? "未恢复保存的旋转角度 \(angle)°")")
+                }
+                if let mode = entry.requestedMode, display.currentMode?.describesSameMode(as: mode) != true {
                     errors.append("\(entry.name)：\(context.modeFailures[entry.identity] ?? "未切换到保存的分辨率 \(mode.label)")")
                 }
                 if let reason = context.visualFailures[entry.identity] { errors.append("\(entry.name)：\(reason)") }
-                else if context.verifiedIDs[entry.identity] != display.id {
+                else if !context.stoppedBeforeVisual && context.verifiedIDs[entry.identity] != display.id {
                     errors.append("\(entry.name)：尚未确认最终亮度和对比度，请重新应用预设")
                 }
-            } else if display != nil {
+            } else if display != nil || (context.stoppedBeforeVisual && context.disconnected.contains(entry.identity)) {
                 errors.append("\(entry.name)：\(context.disableFailures[entry.identity] ?? "显示器没有按预设断开")")
             }
+        }
+        if context.stoppedBeforeVisual {
+            errors.append("预设未完成，已停止调整亮度和对比度，请确认显示器状态后重试。")
         }
         isRunning = false
         context.completion(errors)

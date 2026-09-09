@@ -304,6 +304,62 @@ struct DisplayCoreTests {
             _ = controller.setEnabled(true, identity: identity)
             try coreExpect(backend.enabledCalls.count == 1, "recovery result still must match requested UUID")
         }
-        print("DisplayCore: 16 regression scenarios passed")
+        // Rotation is read as a standard angle; changing its axis transposes
+        // both logical and pixel geometry without changing refresh or scaling.
+        do {
+            try coreExpect(DisplayRotation.normalized(-90) == 270 && DisplayRotation.normalized(450) == 90,
+                           "normalize wrapped standard rotations")
+            try coreExpect(DisplayRotation.normalized(359.999) == 0 && DisplayRotation.normalized(45) == nil
+                           && DisplayRotation.normalized(.nan) == nil && DisplayRotation.normalized(.infinity) == nil,
+                           "reject invalid angles without inventing an orientation")
+            let portrait = coreMode.rotated(from: 0, to: 270)
+            try coreExpect(portrait.width == 1080 && portrait.height == 1920 && portrait.pixelWidth == 2160
+                           && portrait.pixelHeight == 3840 && portrait.refreshRate == 60, "transpose logical and backing dimensions together")
+            try coreExpect(portrait.rotated(from: 270, to: 0) == coreMode && coreMode.rotated(from: 0, to: 180) == coreMode,
+                           "rotation preserves exact mode on inverse and half turns")
+            try coreExpect(!portrait.hasSameOrientation(as: coreMode), "portrait and landscape are distinct")
+        }
+        // V4 acquires only a matching live angle. V5 nil explicitly means
+        // follow-current and must never be silently converted to a fixed angle.
+        do {
+            let defaults = CoreMemoryPreferences()
+            let landscape = coreEntry("uuid:screen")
+            var portrait = landscape; portrait.mode = coreMode.rotated(from: 0, to: 90)
+            let original = PresetCollection(presetA: DisplayPreset(name: "Landscape", displays: [landscape]),
+                                            presetB: DisplayPreset(name: "Portrait", displays: [portrait]))
+            let bytes = try JSONEncoder().encode(original)
+            defaults.values["displayPresetsV4"] = bytes
+            let display = DisplayInfo(id: 1, name: landscape.name, active: true, builtin: false, identity: landscape.identity,
+                                      currentMode: coreMode, availableModes: [coreMode], rotation: 180)
+            let store = PresetStore(defaults: defaults)
+            let migrated = store.load(displays: [display])
+            try coreExpect(migrated.presetA.displays[0].rotation == 180 && migrated.presetB.displays[0].rotation == nil,
+                           "learn only a live angle whose mode orientation matches the saved mode")
+            try coreExpect(migrated.presetA.displays[0].mode == landscape.mode && migrated.presetB.displays[0].mode == portrait.mode,
+                           "rotation migration never alters saved resolution or backing dimensions")
+            try coreExpect(defaults.data(forKey: "displayPresetsV4") == bytes && defaults.data(forKey: "displayPresetsV5") != nil,
+                           "V5 migration preserves V4 bytes")
+            var edited = migrated; edited.presetA.displays[0].rotation = nil; edited.presetB.displays[0].rotation = 270
+            edited.presetA.displays[0].mode = nil
+            store.save(edited)
+            try coreExpect(store.load(displays: [display]) == edited, "persist keep-current resolution, follow-current and explicit rotation across reload")
+            try coreExpect(store.load(displays: []) == edited, "offline reads preserve saved rotation")
+        }
+        do {
+            let defaults = CoreMemoryPreferences()
+            let portrait = coreMode.rotated(from: 0, to: 90)
+            let display = DisplayInfo(id: 1, name: "Portrait", active: true, builtin: false, identity: "uuid:portrait",
+                                      currentMode: portrait, availableModes: [portrait], rotation: 270)
+            let stored = PresetStore(defaults: defaults).load(displays: [display])
+            try coreExpect(stored.presetA.displays[0].rotation == 270, "new presets record the actual angle instead of guessing 90")
+            let conflicts = DisplayIdentity.protectConflicts([display, display])
+            try coreExpect(conflicts.allSatisfy { $0.rotation == 270 && !$0.canControl }, "identity protection copies rotation metadata")
+            let backend = CoreFakeBackend()
+            backend.resolved[display.identity] = display
+            defaults.values["knownDisplaysV3"] = try JSONEncoder().encode([StoredDisplay(display)])
+            let remembered = DisplayController(defaults: defaults, backend: backend).displays(includeModes: false)
+            try coreExpect(remembered.first?.rotation == 270, "remembered display resolution retains fresh rotation")
+        }
+        print("DisplayCore: 19 regression scenarios passed")
     }
 }

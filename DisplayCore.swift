@@ -8,6 +8,17 @@ private func CGSConfigureDisplayEnabled(
     _ enabled: Bool
 ) -> CGError
 
+enum DisplayRotation {
+    static let angles = [0, 90, 180, 270]
+
+    static func normalized(_ degrees: Double) -> Int? {
+        guard degrees.isFinite else { return nil }
+        let wrapped = degrees.truncatingRemainder(dividingBy: 360)
+        let positive = wrapped < 0 ? wrapped + 360 : wrapped
+        return angles.first { min(abs(positive - Double($0)), 360 - abs(positive - Double($0))) < 0.01 }
+    }
+}
+
 struct DisplayModeInfo: Codable, Equatable, Hashable {
     let modeID: Int32
     let width: Int
@@ -65,6 +76,18 @@ struct DisplayModeInfo: Codable, Equatable, Hashable {
             && pixelHeight == other.pixelHeight
             && refreshMatches
     }
+
+    func hasSameOrientation(as other: DisplayModeInfo) -> Bool {
+        width > 0 && height > 0 && other.width > 0 && other.height > 0
+            && (width == height ? other.width == other.height : (width > height) == (other.width > other.height) && other.width != other.height)
+    }
+
+    func rotated(from original: Int, to target: Int) -> DisplayModeInfo {
+        guard DisplayRotation.angles.contains(original), DisplayRotation.angles.contains(target),
+              abs(target - original) % 180 == 90 else { return self }
+        return DisplayModeInfo(modeID: modeID, width: height, height: width,
+                               pixelWidth: pixelHeight, pixelHeight: pixelWidth, refreshRate: refreshRate)
+    }
 }
 
 struct DisplayInfo {
@@ -77,10 +100,11 @@ struct DisplayInfo {
     let availableModes: [DisplayModeInfo]
     let legacyIdentity: String?
     let canControl: Bool
+    let rotation: Int?
 
     init(id: CGDirectDisplayID, name: String, active: Bool, builtin: Bool, identity: String,
          currentMode: DisplayModeInfo?, availableModes: [DisplayModeInfo],
-         legacyIdentity: String? = nil, canControl: Bool = true) {
+         legacyIdentity: String? = nil, canControl: Bool = true, rotation: Int? = nil) {
         self.id = id
         self.name = name
         self.active = active
@@ -90,6 +114,7 @@ struct DisplayInfo {
         self.availableModes = availableModes
         self.legacyIdentity = legacyIdentity
         self.canControl = canControl
+        self.rotation = rotation.flatMap { DisplayRotation.angles.contains($0) ? $0 : nil }
     }
 }
 
@@ -130,6 +155,14 @@ struct DisplayPresetEntry: Codable, Equatable {
     var brightness: Double
     var contrast: Double
     var mode: DisplayModeInfo?
+    var rotation: Int? = nil
+    var applyGeometry: Bool? = nil
+
+    // Existing zero-brightness presets express a blackout. Keep their saved
+    // geometry for later editing, but do not require it unless explicitly opted in.
+    var controlsGeometry: Bool { applyGeometry ?? (brightness > 0) }
+    var requestedMode: DisplayModeInfo? { controlsGeometry ? mode : nil }
+    var requestedRotation: Int? { controlsGeometry ? rotation : nil }
 }
 
 struct DisplayPreset: Codable, Equatable {
@@ -234,7 +267,7 @@ enum DisplayIdentity {
                 return DisplayInfo(id: display.id, name: display.name + "（身份冲突）", active: display.active,
                                    builtin: display.builtin, identity: "unresolved:\(display.identity):\(display.id)",
                                    currentMode: display.currentMode, availableModes: display.availableModes,
-                                   legacyIdentity: display.legacyIdentity, canControl: false)
+                                   legacyIdentity: display.legacyIdentity, canControl: false, rotation: display.rotation)
             }
             return display
         }
@@ -304,7 +337,7 @@ final class DisplayController {
                 return DisplayInfo(id: resolved.id, name: record.name, active: resolved.active, builtin: resolved.builtin,
                                    identity: resolved.identity, currentMode: resolved.currentMode,
                                    availableModes: resolved.availableModes,
-                                   legacyIdentity: resolved.legacyIdentity, canControl: true)
+                                   legacyIdentity: resolved.legacyIdentity, canControl: true, rotation: resolved.rotation)
             }
             return record.displayInfo
         }
@@ -508,7 +541,8 @@ struct QuartzDisplayBackend: DisplayBackend {
                            builtin: builtin, identity: identity,
                            currentMode: CGDisplayCopyDisplayMode(id).map(DisplayModeInfo.init),
                            availableModes: includeModes ? displayModes(id) : [],
-                           legacyIdentity: legacyIdentity(id), canControl: !identity.hasPrefix("unresolved:"))
+                           legacyIdentity: legacyIdentity(id), canControl: !identity.hasPrefix("unresolved:"),
+                           rotation: CGDisplayIsActive(id) != 0 ? DisplayRotation.normalized(CGDisplayRotation(id)) : nil)
     }
 
     private func uuidIdentity(_ id: CGDirectDisplayID) -> String? {
@@ -555,13 +589,13 @@ struct QuartzDisplayBackend: DisplayBackend {
 
 final class PresetStore {
     private let defaults: PreferenceStorage
-    private let storageKey = "displayPresetsV4"
+    private let storageKey = "displayPresetsV5"
 
     init(defaults: PreferenceStorage = UserDefaults.standard) { self.defaults = defaults }
 
     func load(displays: [DisplayInfo]) -> PresetCollection {
         let decoded = loadStoredCollection()
-        var collection = decoded ?? PresetCollection(
+        var collection = decoded?.collection ?? PresetCollection(
             presetA: DisplayPreset(name: "预设 A", displays: []),
             presetB: DisplayPreset(name: "预设 B", displays: [])
         )
@@ -572,8 +606,13 @@ final class PresetStore {
         let displays = displays.filter { !ignored.contains($0.identity) && !DisplayIdentity.isAnonymousVirtual($0.legacyIdentity) }
         migrateLegacyIdentities(&collection.presetA, displays: displays)
         migrateLegacyIdentities(&collection.presetB, displays: displays)
-        synchronize(&collection.presetA, with: displays, defaultBrightness: legacyBrightness("presetA", fallback: 0.35))
-        synchronize(&collection.presetB, with: displays, defaultBrightness: legacyBrightness("presetB", fallback: 0.80))
+        let migrating = decoded?.isLegacy == true
+        synchronize(&collection.presetA, with: displays, defaultBrightness: legacyBrightness("presetA", fallback: 0.35), learnMissingModes: migrating)
+        synchronize(&collection.presetB, with: displays, defaultBrightness: legacyBrightness("presetB", fallback: 0.80), learnMissingModes: migrating)
+        if migrating {
+            learnLegacyRotations(&collection.presetA, displays: displays)
+            learnLegacyRotations(&collection.presetB, displays: displays)
+        }
         if collection != original || defaults.data(forKey: storageKey) == nil { save(collection) }
         return collection
     }
@@ -583,25 +622,38 @@ final class PresetStore {
         defaults.set(data, forKey: storageKey)
     }
 
-    private func loadStoredCollection() -> PresetCollection? {
+    private func loadStoredCollection() -> (collection: PresetCollection, isLegacy: Bool)? {
         // Old keys remain byte-for-byte intact to make this migration reversible.
-        for key in [storageKey, "displayPresetsV3", "displayPresetsV2", "displayPresetsV1"] {
+        for key in [storageKey, "displayPresetsV4", "displayPresetsV3", "displayPresetsV2", "displayPresetsV1"] {
             if let data = defaults.data(forKey: key),
-               let value = try? JSONDecoder().decode(PresetCollection.self, from: data) { return value }
+               let value = try? JSONDecoder().decode(PresetCollection.self, from: data) { return (value, key != storageKey) }
         }
         return nil
     }
 
-    private func synchronize(_ preset: inout DisplayPreset, with displays: [DisplayInfo], defaultBrightness: Double) {
+    private func learnLegacyRotations(_ preset: inout DisplayPreset, displays: [DisplayInfo]) {
+        for index in preset.displays.indices where preset.displays[index].rotation == nil {
+            let matches = displays.filter { $0.identity == preset.displays[index].identity && $0.active && $0.canControl }
+            guard matches.count == 1, let display = matches.first, let rotation = display.rotation,
+                  let current = display.currentMode, let saved = preset.displays[index].mode,
+                  saved.hasSameOrientation(as: current) else { continue }
+            // Dimensions reveal orientation, never whether a portrait screen is
+            // rotated 90 or 270 degrees. Learn only the actual matching live angle.
+            preset.displays[index].rotation = rotation
+        }
+    }
+
+    private func synchronize(_ preset: inout DisplayPreset, with displays: [DisplayInfo], defaultBrightness: Double, learnMissingModes: Bool) {
         for display in displays where !display.identity.hasPrefix("unresolved:") {
             if let index = preset.displays.firstIndex(where: { $0.identity == display.identity }) {
                 // Offline names and empty mode lists must not erase saved settings.
                 if display.canControl { preset.displays[index].name = display.name }
-                if preset.displays[index].mode == nil { preset.displays[index].mode = display.currentMode }
+                if learnMissingModes && preset.displays[index].mode == nil { preset.displays[index].mode = display.currentMode }
             } else {
                 preset.displays.append(DisplayPresetEntry(
                     identity: display.identity, name: display.name, enabled: display.active,
-                    brightness: defaultBrightness, contrast: 0, mode: display.currentMode
+                    brightness: defaultBrightness, contrast: 0, mode: display.currentMode,
+                    rotation: display.active ? display.rotation : nil
                 ))
             }
         }

@@ -78,6 +78,74 @@ final class BetterDisplayBridge {
         pending.values.forEach { $0.cancelTimeout() }
     }
 
+    func setRotation(
+        rotation: Int,
+        displayID: CGDirectDisplayID,
+        isCurrentDisplay: @escaping () -> Bool = { true },
+        completion: @escaping (Result<Void, AppFailure>) -> Void
+    ) {
+        onMain {
+            guard self.validate(rotation: rotation, completion: completion) else { return }
+            // Avoid rebuilding the framebuffer when its orientation is already correct.
+            guard isCurrentDisplay() else {
+                completion(.failure(AppFailure(message: "显示器身份已变化，已取消旋转。")))
+                return
+            }
+            self.readValue("rotation", displayID: displayID) { result in
+                guard isCurrentDisplay() else {
+                    completion(.failure(AppFailure(message: "显示器身份已变化，已取消旋转。")))
+                    return
+                }
+                switch result {
+                case .failure(let failure): completion(.failure(failure))
+                case .success(let actual) where actual == Double(rotation): completion(.success(()))
+                case .success:
+                    self.request(commands: ["set"], parameters: [
+                        "displayID": String(displayID), "rotation": String(rotation)
+                    ]) { result in
+                        switch result {
+                        case .failure(let failure): completion(.failure(failure))
+                        case .success:
+                            self.verifyRotation(rotation: rotation, displayID: displayID, completion: completion)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func verifyRotation(
+        rotation: Int,
+        displayID: CGDirectDisplayID,
+        completion: @escaping (Result<Void, AppFailure>) -> Void
+    ) {
+        onMain {
+            guard self.validate(rotation: rotation, completion: completion) else { return }
+            self.verifyRotation(rotation: rotation, displayID: displayID, attempt: 0, completion: completion)
+        }
+    }
+
+    private func verifyRotation(
+        rotation: Int, displayID: CGDirectDisplayID, attempt: Int,
+        completion: @escaping (Result<Void, AppFailure>) -> Void
+    ) {
+        readValue("rotation", displayID: displayID) { result in
+            switch result {
+            case .failure(let failure): completion(.failure(failure))
+            case .success(let actual):
+                if actual == Double(rotation) {
+                    completion(.success(()))
+                } else if attempt < 2 {
+                    _ = self.transport.schedule(after: 0.35) {
+                        self.verifyRotation(rotation: rotation, displayID: displayID, attempt: attempt + 1, completion: completion)
+                    }
+                } else {
+                    completion(.failure(AppFailure(message: "BetterDisplay 读回结果不一致：旋转角度目标 \(rotation)°，实际 \(actual)°。")))
+                }
+            }
+        }
+    }
+
     func setVisualSettings(
         brightness: Double,
         contrast: Double,
@@ -164,7 +232,8 @@ final class BetterDisplayBridge {
             case .failure(let failure): completion(.failure(failure))
             case .success(let payload):
                 guard let payload, let value = Double(payload.trimmingCharacters(in: .whitespacesAndNewlines)), value.isFinite else {
-                    completion(.failure(AppFailure(message: "BetterDisplay 未返回可验证的\(feature == "brightness" ? "亮度" : "对比度")数值。")))
+                    let label = ["brightness": "亮度", "contrast": "对比度", "rotation": "旋转角度"][feature] ?? feature
+                    completion(.failure(AppFailure(message: "BetterDisplay 未返回可验证的\(label)数值。")))
                     return
                 }
                 completion(.success(value))
@@ -220,6 +289,14 @@ final class BetterDisplayBridge {
     private func validate(brightness: Double, contrast: Double, completion: (Result<Void, AppFailure>) -> Void) -> Bool {
         guard brightness.isFinite, contrast.isFinite, (0...1).contains(brightness), (-0.9...0.9).contains(contrast) else {
             completion(.failure(AppFailure(message: "预设中的亮度或对比度数值无效，请重新编辑预设。")))
+            return false
+        }
+        return true
+    }
+
+    private func validate(rotation: Int, completion: (Result<Void, AppFailure>) -> Void) -> Bool {
+        guard [0, 90, 180, 270].contains(rotation) else {
+            completion(.failure(AppFailure(message: "预设中的旋转角度无效，请重新编辑预设。")))
             return false
         }
         return true

@@ -4,6 +4,7 @@ import ServiceManagement
 
 final class DisplayPresetRowView: NSBox {
     private var entry: DisplayPresetEntry
+    private let display: DisplayInfo
     private var modes: [DisplayModeInfo]
     private let enabledButton: NSButton
     private let brightnessSlider: NSSlider
@@ -11,15 +12,15 @@ final class DisplayPresetRowView: NSBox {
     private let brightnessValue = NSTextField(labelWithString: "")
     private let contrastValue = NSTextField(labelWithString: "")
     private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let rotationPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let geometryButton = NSButton(checkboxWithTitle: "应用分辨率与旋转", target: nil, action: nil)
+    private let rotationHint = NSTextField(wrappingLabelWithString: "")
     var onChange: ((DisplayPresetEntry) -> Void)?
 
     init(display: DisplayInfo, entry: DisplayPresetEntry) {
         self.entry = entry
-        modes = display.availableModes
-        if let savedMode = entry.mode,
-           !modes.contains(where: { $0.describesSameMode(as: savedMode) }) {
-            modes.append(savedMode)
-        }
+        self.display = display
+        modes = []
 
         enabledButton = NSButton(checkboxWithTitle: display.name, target: nil, action: nil)
         brightnessSlider = NSSlider(value: entry.brightness * 100, minValue: 0, maxValue: 100, target: nil, action: nil)
@@ -64,29 +65,26 @@ final class DisplayPresetRowView: NSBox {
 
         modePopup.target = self
         modePopup.action = #selector(modeChanged)
-        modePopup.removeAllItems()
-        if modes.isEmpty {
-            modePopup.addItem(withTitle: "未记录（连接显示器后可选择）")
-        } else {
-            for mode in modes {
-                let isUnavailable = !display.availableModes.contains(where: { $0.describesSameMode(as: mode) })
-                let item = NSMenuItem(title: mode.label + (isUnavailable ? " · 当前不可用" : ""), action: nil, keyEquivalent: "")
-                item.representedObject = mode
-                modePopup.menu?.addItem(item)
-            }
-            if let selected = entry.mode,
-               let index = modes.firstIndex(where: { $0.describesSameMode(as: selected) }) {
-                modePopup.selectItem(at: index)
-            } else if let current = display.currentMode,
-                      let index = modes.firstIndex(where: { $0.describesSameMode(as: current) }) {
-                modePopup.selectItem(at: index)
-                entry.mode = modes[index]
-            }
+        modePopup.identifier = NSUserInterfaceItemIdentifier("presetMode")
+        rotationPopup.target = self
+        rotationPopup.action = #selector(rotationChanged)
+        rotationPopup.identifier = NSUserInterfaceItemIdentifier("presetRotation")
+        rotationPopup.addItem(withTitle: "跟随当前")
+        for angle in DisplayRotation.angles {
+            let item = NSMenuItem(title: "\(angle)°", action: nil, keyEquivalent: "")
+            item.representedObject = NSNumber(value: angle)
+            rotationPopup.menu?.addItem(item)
         }
+        rebuildModePopup()
+        geometryButton.target = self
+        geometryButton.action = #selector(geometryChanged)
+        geometryButton.identifier = NSUserInterfaceItemIdentifier("presetGeometry")
 
         let grid = NSGridView(views: [
             [fieldLabel("亮度"), brightnessSlider, brightnessValue],
             [fieldLabel("对比度调整"), contrastSlider, contrastValue],
+            [fieldLabel("显示模式"), geometryButton, NSView()],
+            [fieldLabel("旋转"), rotationPopup, NSView()],
             [fieldLabel("分辨率"), modePopup, NSView()]
         ])
         grid.column(at: 0).width = 88
@@ -98,8 +96,9 @@ final class DisplayPresetRowView: NSBox {
         let hint = NSTextField(wrappingLabelWithString: "对比度 0% 为默认；负值更柔和，正值更强烈。")
         hint.textColor = .tertiaryLabelColor
         hint.font = .systemFont(ofSize: 11)
+        rotationHint.font = .systemFont(ofSize: 11)
 
-        let stack = NSStackView(views: [header, grid, hint])
+        let stack = NSStackView(views: [header, grid, rotationHint, hint])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -112,6 +111,7 @@ final class DisplayPresetRowView: NSBox {
             stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             grid.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            rotationHint.widthAnchor.constraint(equalTo: stack.widthAnchor),
             hint.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
     }
@@ -120,6 +120,31 @@ final class DisplayPresetRowView: NSBox {
         let label = NSTextField(labelWithString: title)
         label.alignment = .right
         return label
+    }
+
+    private func modeForSelectedRotation(_ mode: DisplayModeInfo) -> DisplayModeInfo {
+        guard let source = display.rotation, let target = entry.rotation else { return mode }
+        return mode.rotated(from: source, to: target)
+    }
+
+    private func rebuildModePopup() {
+        let available = display.availableModes.map(modeForSelectedRotation)
+        modes = available
+        if let saved = entry.mode, saved.matchingMode(in: modes) == nil { modes.append(saved) }
+        modePopup.removeAllItems()
+        modePopup.addItem(withTitle: "保持当前")
+        for mode in modes {
+            let unavailable = mode.matchingMode(in: available) == nil
+            let pendingRotation = entry.rotation != nil && entry.rotation != display.rotation
+            let suffix = unavailable ? " · 当前不可用" : (pendingRotation ? " · 旋转后可选" : "")
+            let item = NSMenuItem(title: mode.label + suffix, action: nil, keyEquivalent: "")
+            item.representedObject = mode
+            modePopup.menu?.addItem(item)
+        }
+        let selected = entry.mode
+        if let selected, let index = modes.firstIndex(where: { $0.describesSameMode(as: selected) }) {
+            modePopup.selectItem(at: index + 1)
+        } else { modePopup.selectItem(at: 0) }
     }
 
     private func updateControls() {
@@ -131,7 +156,22 @@ final class DisplayPresetRowView: NSBox {
         contrastValue.stringValue = contrast > 0 ? "+\(contrast)%" : "\(contrast)%"
         brightnessSlider.isEnabled = entry.enabled
         contrastSlider.isEnabled = entry.enabled
-        modePopup.isEnabled = entry.enabled && !modes.isEmpty
+        geometryButton.state = entry.controlsGeometry ? .on : .off
+        geometryButton.isEnabled = entry.enabled
+        modePopup.isEnabled = entry.enabled && entry.controlsGeometry
+        rotationPopup.isEnabled = entry.enabled && entry.controlsGeometry
+        rotationPopup.selectItem(at: entry.rotation.flatMap { DisplayRotation.angles.firstIndex(of: $0).map { $0 + 1 } } ?? 0)
+        if !entry.controlsGeometry {
+            rotationHint.stringValue = "仅调整连接、亮度和对比度；已保存的分辨率与旋转设置仍会保留。"
+            rotationHint.textColor = .tertiaryLabelColor
+        } else if entry.rotation == nil, let saved = entry.mode, let current = display.currentMode,
+           !saved.hasSameOrientation(as: current) {
+            rotationHint.stringValue = "已保存分辨率与当前屏幕方向不同，请选择旋转角度；竖屏需明确选择 90° 或 270°。"
+            rotationHint.textColor = .systemOrange
+        } else {
+            rotationHint.stringValue = "跟随当前保留屏幕方向；修改旋转角度需要 BetterDisplay Pro 支持。"
+            rotationHint.textColor = .tertiaryLabelColor
+        }
     }
 
     private func publishChange() {
@@ -154,11 +194,34 @@ final class DisplayPresetRowView: NSBox {
         publishChange()
     }
 
+    @objc private func geometryChanged() {
+        entry.applyGeometry = geometryButton.state == .on
+        publishChange()
+    }
+
     @objc private func modeChanged() {
-        if let mode = modePopup.selectedItem?.representedObject as? DisplayModeInfo {
-            entry.mode = mode
-            publishChange()
+        entry.mode = modePopup.selectedItem?.representedObject as? DisplayModeInfo
+        publishChange()
+    }
+
+    @objc private func rotationChanged() {
+        let selected = (rotationPopup.selectedItem?.representedObject as? NSNumber)?.intValue
+        let target = selected ?? display.rotation
+        if let saved = entry.mode, let target {
+            if let original = entry.rotation {
+                entry.mode = saved.rotated(from: original, to: target)
+            } else if let current = display.currentMode, let source = display.rotation {
+                let reference = current.rotated(from: source, to: target)
+                if !saved.hasSameOrientation(as: reference) {
+                    // This transforms only geometry to the explicitly selected
+                    // orientation; it never guesses a missing 90/270 degree angle.
+                    entry.mode = saved.rotated(from: 0, to: 90)
+                }
+            }
         }
+        entry.rotation = selected
+        rebuildModePopup()
+        publishChange()
     }
 }
 
@@ -228,7 +291,7 @@ final class PresetWindowController: NSWindowController, NSTextFieldDelegate {
         header.alignment = .centerY
         header.spacing = 10
 
-        let description = NSTextField(wrappingLabelWithString: "为每块显示器分别保存开关状态、亮度、对比度调整和分辨率。菜单栏中可用 ⌘1 / ⌘2 一键切换。")
+        let description = NSTextField(wrappingLabelWithString: "为每块显示器分别保存开关状态、亮度、对比度调整、旋转和分辨率。菜单栏中可用 ⌘1 / ⌘2 一键切换。")
         description.textColor = .secondaryLabelColor
 
         listStack.orientation = .vertical
@@ -398,7 +461,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         verifyVisual: { [unowned self] brightness, contrast, id, completion in
             self.betterDisplay.verifyVisualSettings(brightness: brightness, contrast: contrast, displayID: id, completion: completion)
         },
-        schedule: { delay, action in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action) }
+        schedule: { delay, action in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action) },
+        setRotation: { [unowned self] rotation, identity, completion in
+            guard let display = self.displayController.resolveDisplay(identity: identity), display.active else {
+                completion(.failure(AppFailure(message: "无法核实旋转目标显示器，或显示器尚未连接。")))
+                return
+            }
+            self.betterDisplay.setRotation(rotation: rotation, displayID: display.id, isCurrentDisplay: { [weak self] in
+                guard let current = self?.displayController.resolveDisplay(identity: identity) else { return false }
+                return current.active && current.id == display.id
+            }, completion: completion)
+        }
     ))
 
     func applicationDidFinishLaunching(_ notification: Notification) {
