@@ -158,9 +158,9 @@ struct DisplayPresetEntry: Codable, Equatable {
     var rotation: Int? = nil
     var applyGeometry: Bool? = nil
 
-    // Existing zero-brightness presets express a blackout. Keep their saved
-    // geometry for later editing, but do not require it unless explicitly opted in.
-    var controlsGeometry: Bool { applyGeometry ?? (brightness > 0) }
+    // Blackout does not need a particular orientation or resolution. Preserve
+    // the stored choice so it takes effect again when brightness is raised.
+    var controlsGeometry: Bool { brightness > 0 && (applyGeometry ?? true) }
     var requestedMode: DisplayModeInfo? { controlsGeometry ? mode : nil }
     var requestedRotation: Int? { controlsGeometry ? rotation : nil }
 }

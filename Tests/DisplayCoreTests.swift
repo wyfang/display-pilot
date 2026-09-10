@@ -360,6 +360,29 @@ struct DisplayCoreTests {
             let remembered = DisplayController(defaults: defaults, backend: backend).displays(includeModes: false)
             try coreExpect(remembered.first?.rotation == 270, "remembered display resolution retains fresh rotation")
         }
-        print("DisplayCore: 19 regression scenarios passed")
+        // Blackout suspends geometry even for an explicit stored true. The
+        // stored choice, exact mode and angle remain available after brightening.
+        do {
+            for preference in [nil, true, false] as [Bool?] {
+                var original = coreEntry("uuid:blackout", brightness: 0, contrast: -0.9)
+                original.rotation = 270
+                original.applyGeometry = preference
+                let bytes = try JSONEncoder().encode(original)
+                let restored = try JSONDecoder().decode(DisplayPresetEntry.self, from: bytes)
+                try coreExpect(restored == original, "JSON roundtrip preserves every blackout field and optional geometry choice")
+                try coreExpect(!restored.controlsGeometry && restored.requestedMode == nil && restored.requestedRotation == nil,
+                               "zero brightness never requests geometry, including explicit applyGeometry true")
+                var brightened = restored
+                brightened.brightness = 0.65
+                let appliesGeometry = preference ?? true
+                try coreExpect(brightened.controlsGeometry == appliesGeometry
+                               && brightened.requestedMode == (appliesGeometry ? coreMode : nil)
+                               && brightened.requestedRotation == (appliesGeometry ? 270 : nil),
+                               "positive brightness restores the stored geometry policy and exact geometry")
+                brightened.brightness = 0
+                try coreExpect(brightened == original, "brightness roundtrip does not rewrite saved geometry or contrast")
+            }
+        }
+        print("DisplayCore: 20 regression scenarios passed")
     }
 }

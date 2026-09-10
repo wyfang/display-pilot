@@ -62,24 +62,42 @@ private enum InterfaceTests {
         _ = ambiguousRotation.sendAction(ambiguousRotation.action, to: ambiguousRotation.target)
         precondition(resolved?.rotation == 270 && resolved?.mode == ambiguousEntry.mode,
                      "choosing the unknown portrait angle preserves the existing portrait resolution")
-        var blackoutEntry = ambiguousEntry
-        blackoutEntry.brightness = 0
-        let blackout = DisplayPresetRowView(display: display, entry: blackoutEntry)
-        let geometry = descendants(blackout).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "presetGeometry" }!
-        let blackoutMode = descendants(blackout).compactMap { $0 as? NSPopUpButton }.first { $0.identifier?.rawValue == "presetMode" }!
-        precondition(geometry.state == .off && !blackoutMode.isEnabled, "legacy blackout defaults to connection and visual settings only")
-        var blackoutChange: DisplayPresetEntry?
-        blackout.onChange = { blackoutChange = $0 }
-        geometry.state = .on
-        _ = geometry.sendAction(geometry.action, to: geometry.target)
-        precondition(blackoutChange?.applyGeometry == true && blackoutMode.isEnabled, "blackout can explicitly enforce geometry")
-        precondition(blackoutChange?.mode == blackoutEntry.mode, "geometry toggle preserves saved resolution")
-        let encoded = try! JSONEncoder().encode(blackoutChange!)
-        let decoded = try! JSONDecoder().decode(DisplayPresetEntry.self, from: encoded)
-        precondition(decoded.controlsGeometry && decoded.brightness == 0, "explicit blackout geometry preference survives persistence")
-        geometry.state = .off
-        _ = geometry.sendAction(geometry.action, to: geometry.target)
-        precondition(blackoutChange?.applyGeometry == false && blackoutChange?.mode == blackoutEntry.mode, "disabling geometry does not discard it")
+        for preference in [nil, true, false] as [Bool?] {
+            var blackoutEntry = ambiguousEntry
+            blackoutEntry.brightness = 0
+            blackoutEntry.rotation = 270
+            blackoutEntry.applyGeometry = preference
+            let blackout = DisplayPresetRowView(display: display, entry: blackoutEntry)
+            let controls = descendants(blackout)
+            let geometry = controls.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "presetGeometry" }!
+            let blackoutMode = controls.compactMap { $0 as? NSPopUpButton }.first { $0.identifier?.rawValue == "presetMode" }!
+            let blackoutRotation = controls.compactMap { $0 as? NSPopUpButton }.first { $0.identifier?.rawValue == "presetRotation" }!
+            let brightness = controls.compactMap { $0 as? NSSlider }.first { $0.identifier?.rawValue == "presetBrightness" }!
+            precondition(geometry.state == .off && !geometry.isEnabled && !blackoutMode.isEnabled && !blackoutRotation.isEnabled,
+                         "blackout disables all geometry controls even when the stored choice is explicitly true")
+            precondition((blackoutMode.selectedItem?.representedObject as? DisplayModeInfo) == blackoutEntry.mode
+                         && blackoutRotation.titleOfSelectedItem == "270°", "disabled geometry controls retain saved selections")
+            precondition(controls.compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains("亮度为 0 时跳过分辨率与旋转") },
+                         "blackout explains why geometry is suspended")
+            var blackoutChange: DisplayPresetEntry?
+            blackout.onChange = { blackoutChange = $0 }
+            brightness.doubleValue = 65
+            _ = brightness.sendAction(brightness.action, to: brightness.target)
+            let appliesGeometry = preference ?? true
+            precondition(geometry.isEnabled && geometry.state == (appliesGeometry ? .on : .off)
+                         && blackoutMode.isEnabled == appliesGeometry && blackoutRotation.isEnabled == appliesGeometry,
+                         "raising brightness restores the explicit true, false or legacy geometry policy")
+            precondition(blackoutChange?.brightness == 0.65 && blackoutChange?.applyGeometry == preference
+                         && blackoutChange?.mode == blackoutEntry.mode && blackoutChange?.rotation == 270,
+                         "raising brightness preserves the stored geometry data")
+            brightness.doubleValue = 0
+            _ = brightness.sendAction(brightness.action, to: brightness.target)
+            precondition(blackoutChange == blackoutEntry && !geometry.isEnabled && !blackoutMode.isEnabled && !blackoutRotation.isEnabled,
+                         "returning to blackout suspends geometry without modifying saved fields")
+            let encoded = try! JSONEncoder().encode(blackoutChange!)
+            let decoded = try! JSONDecoder().decode(DisplayPresetEntry.self, from: encoded)
+            precondition(decoded == blackoutEntry && !decoded.controlsGeometry, "blackout editor roundtrip preserves geometry without applying it")
+        }
         let memory = Memory()
         let store = PresetStore(defaults: memory)
         let controller = PresetWindowController(store: store) { [display] }
@@ -97,6 +115,6 @@ private enum InterfaceTests {
         controller.setSavingEnabled(false)
         precondition(!save.isEnabled)
         controller.window?.close()
-        print("Interface: duplicate labels, rotation, keep-current resolution, draft preservation and save lock passed")
+        print("Interface: duplicate labels, rotation, blackout geometry suspension, draft preservation and save lock passed")
     }
 }

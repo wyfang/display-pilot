@@ -286,7 +286,7 @@ struct BetterDisplayBridgeTests {
     }
 
     private static func rotationReadAndSetFailuresStop() {
-        for scenario in 0..<3 {
+        for scenario in 0..<6 {
             let transport = FakeTransport()
             let bridge = BetterDisplayBridge(transport: transport)
             var error: String?
@@ -296,13 +296,25 @@ struct BetterDisplayBridgeTests {
             switch scenario {
             case 0: transport.reply(to: 0, result: false, payload: "Feature unavailable")
             case 1: transport.reply(to: 0, result: true, payload: "nan")
-            default:
+            case 2:
                 transport.reply(to: 0, result: true, payload: "0")
                 transport.reply(to: 1, result: false, payload: "Feature unavailable")
+            case 3: transport.reply(to: 0, result: false, payload: "Pro required.")
+            case 4:
+                transport.reply(to: 0, result: true, payload: "0")
+                transport.reply(to: 1, result: false, payload: "Pro required.")
+            default:
+                transport.reply(to: 0, result: true, payload: "0")
+                transport.reply(to: 1, result: true)
+                transport.reply(to: 2, result: false, payload: "Pro required.")
             }
             precondition(error != nil && transport.timers.isEmpty)
-            precondition(transport.requests.count == (scenario == 2 ? 2 : 1))
+            precondition(transport.requests.count == [1, 1, 2, 1, 2, 3][scenario])
             if scenario == 1 { precondition(error!.contains("旋转角度数值")) }
+            if scenario >= 3 {
+                precondition(error!.contains("旋转控制需要 BetterDisplay Pro") && error!.contains("跟随当前"),
+                             "rotation license failures explain the feature and available preset choices")
+            }
         }
     }
 }

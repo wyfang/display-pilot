@@ -84,29 +84,35 @@ final class BetterDisplayBridge {
         isCurrentDisplay: @escaping () -> Bool = { true },
         completion: @escaping (Result<Void, AppFailure>) -> Void
     ) {
+        let complete: (Result<Void, AppFailure>) -> Void = { result in
+            completion(result.mapError { failure in
+                guard failure.message.localizedCaseInsensitiveContains("pro required") else { return failure }
+                return AppFailure(message: "旋转控制需要 BetterDisplay Pro，当前请求被拒绝。可启用 Pro，或将旋转设为“跟随当前”、分辨率设为“保持当前”。")
+            })
+        }
         onMain {
-            guard self.validate(rotation: rotation, completion: completion) else { return }
+            guard self.validate(rotation: rotation, completion: complete) else { return }
             // Avoid rebuilding the framebuffer when its orientation is already correct.
             guard isCurrentDisplay() else {
-                completion(.failure(AppFailure(message: "显示器身份已变化，已取消旋转。")))
+                complete(.failure(AppFailure(message: "显示器身份已变化，已取消旋转。")))
                 return
             }
             self.readValue("rotation", displayID: displayID) { result in
                 guard isCurrentDisplay() else {
-                    completion(.failure(AppFailure(message: "显示器身份已变化，已取消旋转。")))
+                    complete(.failure(AppFailure(message: "显示器身份已变化，已取消旋转。")))
                     return
                 }
                 switch result {
-                case .failure(let failure): completion(.failure(failure))
-                case .success(let actual) where actual == Double(rotation): completion(.success(()))
+                case .failure(let failure): complete(.failure(failure))
+                case .success(let actual) where actual == Double(rotation): complete(.success(()))
                 case .success:
                     self.request(commands: ["set"], parameters: [
                         "displayID": String(displayID), "rotation": String(rotation)
                     ]) { result in
                         switch result {
-                        case .failure(let failure): completion(.failure(failure))
+                        case .failure(let failure): complete(.failure(failure))
                         case .success:
-                            self.verifyRotation(rotation: rotation, displayID: displayID, completion: completion)
+                            self.verifyRotation(rotation: rotation, displayID: displayID, completion: complete)
                         }
                     }
                 }

@@ -56,6 +56,7 @@ final class DisplayPresetRowView: NSBox {
 
         brightnessSlider.target = self
         brightnessSlider.action = #selector(brightnessChanged)
+        brightnessSlider.identifier = NSUserInterfaceItemIdentifier("presetBrightness")
         contrastSlider.target = self
         contrastSlider.action = #selector(contrastChanged)
         for value in [brightnessValue, contrastValue] {
@@ -157,11 +158,14 @@ final class DisplayPresetRowView: NSBox {
         brightnessSlider.isEnabled = entry.enabled
         contrastSlider.isEnabled = entry.enabled
         geometryButton.state = entry.controlsGeometry ? .on : .off
-        geometryButton.isEnabled = entry.enabled
+        geometryButton.isEnabled = entry.enabled && entry.brightness > 0
         modePopup.isEnabled = entry.enabled && entry.controlsGeometry
         rotationPopup.isEnabled = entry.enabled && entry.controlsGeometry
         rotationPopup.selectItem(at: entry.rotation.flatMap { DisplayRotation.angles.firstIndex(of: $0).map { $0 + 1 } } ?? 0)
-        if !entry.controlsGeometry {
+        if entry.brightness == 0 {
+            rotationHint.stringValue = "亮度为 0 时跳过分辨率与旋转，仅应用连接、亮度和对比度。已保存的显示模式设置会保留，调高亮度后可继续使用。"
+            rotationHint.textColor = .secondaryLabelColor
+        } else if !entry.controlsGeometry {
             rotationHint.stringValue = "仅调整连接、亮度和对比度；已保存的分辨率与旋转设置仍会保留。"
             rotationHint.textColor = .tertiaryLabelColor
         } else if entry.rotation == nil, let saved = entry.mode, let current = display.currentMode,

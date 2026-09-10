@@ -39,12 +39,12 @@ Run `./Tests/run.sh` for isolated regression tests or `./scripts/generate-icon.s
 
 Display Pilot connects the required displays, restores their requested rotation and resolution, then disables unused displays. It waits for the connection changes to settle and restores display modes again before applying brightness and contrast. It prefers system UUIDs and revalidates device identity before switching. Final verification checks connection state, requested display modes, and brightness and contrast read back from BetterDisplay.
 
-Presets with brightness set to 0 apply only connection state, brightness, and contrast by default, so a system orientation change does not report failure after blackout succeeds. Saved resolution and rotation choices are retained. Enable “应用分辨率与旋转” in the preset editor to enforce them, or select “保持当前” for resolution and “跟随当前” for rotation independently.
+Displays with brightness set to 0 apply only connection state, brightness, and contrast. They always skip resolution and rotation, even if “应用分辨率与旋转” was enabled in an existing preset, so rotation permissions or unavailable modes cannot block blackout. The saved switch, resolution, and rotation choices are retained and take effect again according to the switch when brightness is raised. You can also select “保持当前” for resolution and “跟随当前” for rotation independently.
 
 ### Limitations
 
 - Display switching uses the private macOS API `CGSConfigureDisplayEnabled`, which is unsuitable for Mac App Store distribution and may be affected by system updates
-- Changing rotation requires BetterDisplay Pro and display support; preserving the current orientation and the default blackout flow do not call the rotation API
+- Changing rotation requires BetterDisplay Pro and display support; selecting both “跟随当前” for rotation and “保持当前” for resolution, or setting brightness to 0 for blackout, avoids the rotation API
 - Missing BetterDisplay, disabled integration, or mismatched readback prevents a preset from being marked successful
 - Physically disconnected displays cannot be reconnected by software; displays with unverified identities cannot be switched
 - Upgrades retain legacy preset data; ambiguous legacy devices must be configured again. If an old preset has no saved rotation and its orientation differs from the current display, select 90° or 270° explicitly; the app does not guess the direction

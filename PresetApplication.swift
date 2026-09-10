@@ -314,8 +314,7 @@ final class PresetApplication {
                 }
                 if let angle = entry.requestedRotation ?? context.learnedRotations[entry.identity], display.rotation != angle {
                     errors.append("\(entry.name)：\(context.rotationFailures[entry.identity] ?? "未恢复保存的旋转角度 \(angle)°")")
-                }
-                if let mode = entry.requestedMode, display.currentMode?.describesSameMode(as: mode) != true {
+                } else if let mode = entry.requestedMode, display.currentMode?.describesSameMode(as: mode) != true {
                     errors.append("\(entry.name)：\(context.modeFailures[entry.identity] ?? "未切换到保存的分辨率 \(mode.label)")")
                 }
                 if let reason = context.visualFailures[entry.identity] { errors.append("\(entry.name)：\(reason)") }
