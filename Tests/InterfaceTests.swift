@@ -62,6 +62,9 @@ private enum InterfaceTests {
         _ = ambiguousRotation.sendAction(ambiguousRotation.action, to: ambiguousRotation.target)
         precondition(resolved?.rotation == 270 && resolved?.mode == ambiguousEntry.mode,
                      "choosing the unknown portrait angle preserves the existing portrait resolution")
+        precondition(descendants(ambiguous).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.contains("当前旋转 0°，应用预设时将切换为 270°")
+        }, "editor distinguishes the actual and saved rotation before applying")
         for preference in [nil, true, false] as [Bool?] {
             var blackoutEntry = ambiguousEntry
             blackoutEntry.brightness = 0
@@ -73,12 +76,14 @@ private enum InterfaceTests {
             let blackoutMode = controls.compactMap { $0 as? NSPopUpButton }.first { $0.identifier?.rawValue == "presetMode" }!
             let blackoutRotation = controls.compactMap { $0 as? NSPopUpButton }.first { $0.identifier?.rawValue == "presetRotation" }!
             let brightness = controls.compactMap { $0 as? NSSlider }.first { $0.identifier?.rawValue == "presetBrightness" }!
-            precondition(geometry.state == .off && !geometry.isEnabled && !blackoutMode.isEnabled && !blackoutRotation.isEnabled,
-                         "blackout disables all geometry controls even when the stored choice is explicitly true")
+            let blackoutGeometry = preference ?? false
+            precondition(geometry.isEnabled && geometry.state == (blackoutGeometry ? .on : .off)
+                         && blackoutMode.isEnabled == blackoutGeometry && blackoutRotation.isEnabled == blackoutGeometry,
+                         "zero brightness permits explicit geometry while preserving legacy defaults")
             precondition((blackoutMode.selectedItem?.representedObject as? DisplayModeInfo) == blackoutEntry.mode
                          && blackoutRotation.titleOfSelectedItem == "270°", "disabled geometry controls retain saved selections")
-            precondition(controls.compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains("亮度为 0 时跳过分辨率与旋转") },
-                         "blackout explains why geometry is suspended")
+            precondition(!controls.compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains("BetterDisplay Pro") },
+                         "native rotation does not require BetterDisplay Pro")
             var blackoutChange: DisplayPresetEntry?
             blackout.onChange = { blackoutChange = $0 }
             brightness.doubleValue = 65
@@ -92,12 +97,31 @@ private enum InterfaceTests {
                          "raising brightness preserves the stored geometry data")
             brightness.doubleValue = 0
             _ = brightness.sendAction(brightness.action, to: brightness.target)
-            precondition(blackoutChange == blackoutEntry && !geometry.isEnabled && !blackoutMode.isEnabled && !blackoutRotation.isEnabled,
-                         "returning to blackout suspends geometry without modifying saved fields")
+            precondition(blackoutChange == blackoutEntry && geometry.isEnabled
+                         && blackoutMode.isEnabled == blackoutGeometry && blackoutRotation.isEnabled == blackoutGeometry,
+                         "returning to zero preserves explicit geometry choices")
             let encoded = try! JSONEncoder().encode(blackoutChange!)
             let decoded = try! JSONDecoder().decode(DisplayPresetEntry.self, from: encoded)
-            precondition(decoded == blackoutEntry && !decoded.controlsGeometry, "blackout editor roundtrip preserves geometry without applying it")
+            precondition(decoded == blackoutEntry && decoded.controlsGeometry == blackoutGeometry, "blackout editor roundtrip preserves the geometry policy")
         }
+        var fractionalEntry = entry
+        fractionalEntry.brightness = 0.006387486704078639
+        fractionalEntry.applyGeometry = true
+        let fractional = DisplayPresetRowView(display: display, entry: fractionalEntry)
+        let fractionalControls = descendants(fractional)
+        precondition(fractionalControls.compactMap { $0 as? NSTextField }.contains { $0.stringValue == "0.6%" },
+                     "existing sub-percent brightness is displayed as nonzero")
+        let fractionalSlider = fractionalControls.compactMap { $0 as? NSSlider }.first { $0.identifier?.rawValue == "presetBrightness" }!
+        var fractionalChange: DisplayPresetEntry?
+        fractional.onChange = { fractionalChange = $0 }
+        fractionalSlider.doubleValue = 0.4
+        _ = fractionalSlider.sendAction(fractionalSlider.action, to: fractionalSlider.target)
+        precondition(fractionalChange?.brightness == 0 && fractionalChange?.controlsGeometry == true,
+                     "a slider value displayed as zero saves exactly zero without overriding explicit geometry")
+        fractionalSlider.doubleValue = 0.6
+        _ = fractionalSlider.sendAction(fractionalSlider.action, to: fractionalSlider.target)
+        precondition(fractionalChange?.brightness == 0.01 && fractionalChange?.controlsGeometry == true,
+                     "a slider value displayed as one percent saves exactly one percent")
         let memory = Memory()
         let store = PresetStore(defaults: memory)
         let controller = PresetWindowController(store: store) { [display] }
@@ -115,6 +139,6 @@ private enum InterfaceTests {
         controller.setSavingEnabled(false)
         precondition(!save.isEnabled)
         controller.window?.close()
-        print("Interface: duplicate labels, rotation, blackout geometry suspension, draft preservation and save lock passed")
+        print("Interface: duplicate labels, rotation, independent blackout geometry, draft preservation and save lock passed")
     }
 }

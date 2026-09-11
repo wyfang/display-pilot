@@ -158,9 +158,9 @@ struct DisplayPresetEntry: Codable, Equatable {
     var rotation: Int? = nil
     var applyGeometry: Bool? = nil
 
-    // Blackout does not need a particular orientation or resolution. Preserve
-    // the stored choice so it takes effect again when brightness is raised.
-    var controlsGeometry: Bool { brightness > 0 && (applyGeometry ?? true) }
+    // Preserve explicit choices at every brightness. Legacy blackout presets
+    // default to changing connection and visual settings only.
+    var controlsGeometry: Bool { applyGeometry ?? (brightness > 0) }
     var requestedMode: DisplayModeInfo? { controlsGeometry ? mode : nil }
     var requestedRotation: Int? { controlsGeometry ? rotation : nil }
 }
@@ -176,7 +176,9 @@ struct PresetCollection: Codable, Equatable {
 }
 
 struct AppFailure: Error {
+    enum Reason { case general, requiresPro, unavailable }
     let message: String
+    var reason: Reason = .general
 }
 
 protocol PreferenceStorage: AnyObject {
@@ -609,10 +611,6 @@ final class PresetStore {
         let migrating = decoded?.isLegacy == true
         synchronize(&collection.presetA, with: displays, defaultBrightness: legacyBrightness("presetA", fallback: 0.35), learnMissingModes: migrating)
         synchronize(&collection.presetB, with: displays, defaultBrightness: legacyBrightness("presetB", fallback: 0.80), learnMissingModes: migrating)
-        if migrating {
-            learnLegacyRotations(&collection.presetA, displays: displays)
-            learnLegacyRotations(&collection.presetB, displays: displays)
-        }
         if collection != original || defaults.data(forKey: storageKey) == nil { save(collection) }
         return collection
     }
@@ -631,18 +629,6 @@ final class PresetStore {
         return nil
     }
 
-    private func learnLegacyRotations(_ preset: inout DisplayPreset, displays: [DisplayInfo]) {
-        for index in preset.displays.indices where preset.displays[index].rotation == nil {
-            let matches = displays.filter { $0.identity == preset.displays[index].identity && $0.active && $0.canControl }
-            guard matches.count == 1, let display = matches.first, let rotation = display.rotation,
-                  let current = display.currentMode, let saved = preset.displays[index].mode,
-                  saved.hasSameOrientation(as: current) else { continue }
-            // Dimensions reveal orientation, never whether a portrait screen is
-            // rotated 90 or 270 degrees. Learn only the actual matching live angle.
-            preset.displays[index].rotation = rotation
-        }
-    }
-
     private func synchronize(_ preset: inout DisplayPreset, with displays: [DisplayInfo], defaultBrightness: Double, learnMissingModes: Bool) {
         for display in displays where !display.identity.hasPrefix("unresolved:") {
             if let index = preset.displays.firstIndex(where: { $0.identity == display.identity }) {
@@ -653,7 +639,7 @@ final class PresetStore {
                 preset.displays.append(DisplayPresetEntry(
                     identity: display.identity, name: display.name, enabled: display.active,
                     brightness: defaultBrightness, contrast: 0, mode: display.currentMode,
-                    rotation: display.active ? display.rotation : nil
+                    rotation: nil
                 ))
             }
         }

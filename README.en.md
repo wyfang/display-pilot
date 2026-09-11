@@ -37,17 +37,23 @@ Run `./Tests/run.sh` for isolated regression tests or `./scripts/generate-icon.s
 
 ### How it works
 
-Display Pilot connects the required displays, restores their requested rotation and resolution, then disables unused displays. It waits for the connection changes to settle and restores display modes again before applying brightness and contrast. It prefers system UUIDs and revalidates device identity before switching. Final verification checks connection state, requested display modes, and brightness and contrast read back from BetterDisplay.
+Display Pilot turns two common multi-display configurations into single-click menu bar presets. macOS controls display connections, resolution, and rotation. Brightness and contrast use BetterDisplay's notification integration, which shares its CLI protocol.
 
-Displays with brightness set to 0 apply only connection state, brightness, and contrast. They always skip resolution and rotation, even if “应用分辨率与旋转” was enabled in an existing preset, so rotation permissions or unavailable modes cannot block blackout. The saved switch, resolution, and rotation choices are retained and take effect again according to the switch when brightness is raised. You can also select “保持当前” for resolution and “跟随当前” for rotation independently.
+Switching connects target displays, applies requested rotation and resolution, disconnects unwanted displays, then applies and reads back brightness and contrast after the topology settles. Unavailable rotation or resolution does not block other supported settings; results are reported separately. Final checks cover display identity, connections, requested modes, and visual settings, so partial completion is not marked as complete.
+
+“Apply resolution and rotation” is independent of brightness: an explicit selection also applies the saved geometry at 0% brightness. Legacy blackout presets without this option default to changing connection, brightness, and contrast only. “Follow current” does not actively change orientation, and upgrading legacy presets does not add a rotation requirement based on the screen's current angle. Existing explicit settings remain unchanged.
+
+Brightness slider edits save whole percentages, so a displayed 0% saves exactly zero. Existing fractional values are preserved, with nonzero values below 1% shown separately. Explicit rotation uses the native macOS interface without BetterDisplay rotation permissions; 90° and 270° are verified separately.
+
+Already-matched connections and display modes skip unnecessary fixed waits while brightness and contrast are still verified. Actual connection changes retain their stabilization waits.
 
 ### Limitations
 
-- Display switching uses the private macOS API `CGSConfigureDisplayEnabled`, which is unsuitable for Mac App Store distribution and may be affected by system updates
-- Changing rotation requires BetterDisplay Pro and display support; selecting both “跟随当前” for rotation and “保持当前” for resolution, or setting brightness to 0 for blackout, avoids the rotation API
+- Display switching uses the private macOS API `CGSConfigureDisplayEnabled`, and rotation uses the system `MonitorPanel` interface; these are unsuitable for Mac App Store distribution and may be affected by system updates
+- Rotation requires support from macOS and the display. Unsupported rotation is reported separately while other available settings continue
 - Missing BetterDisplay, disabled integration, or mismatched readback prevents a preset from being marked successful
 - Physically disconnected displays cannot be reconnected by software; displays with unverified identities cannot be switched
-- Upgrades retain legacy preset data; ambiguous legacy devices must be configured again. If an old preset has no saved rotation and its orientation differs from the current display, select 90° or 270° explicitly; the app does not guess the direction
+- Upgrades retain legacy preset data; ambiguous legacy devices must be configured again. Choose an explicit angle when active rotation is needed; the app does not infer direction from resolution
 - Cables, docks, mirroring, HDR, and macOS updates may invalidate saved modes
 
 ## License

@@ -14,6 +14,9 @@ esac
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 mkdir -p "$ROOT/.module-cache"
+NATIVE_BUILD="$(mktemp -d "${TMPDIR:-/tmp}/display-pilot-native.XXXXXX")"
+trap 'rm -rf "$NATIVE_BUILD"' EXIT
+xcrun clang -fobjc-arc -target "$TARGET" -c "$ROOT/NativeDisplayRotation.m" -o "$NATIVE_BUILD/NativeDisplayRotation.o"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Assets/DisplayPilot.icns" "$APP/Contents/Resources/DisplayPilot.icns"
 xcrun swiftc \
@@ -23,6 +26,8 @@ xcrun swiftc \
   -framework AppKit \
   -framework CoreGraphics \
   -framework ServiceManagement \
+  "$NATIVE_BUILD/NativeDisplayRotation.o" \
+  "$ROOT/NativeDisplayRotation.swift" \
   "$ROOT/DisplayCore.swift" \
   "$ROOT/BetterDisplayBridge.swift" \
   "$ROOT/PresetApplication.swift" \

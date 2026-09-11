@@ -37,10 +37,15 @@ private final class Fixture {
     var afterDisable: (() -> Void)?
     var afterEnable: (() -> Void)?
     var afterRotation: (() -> Void)?
+    var afterFailedRotation: (() -> Void)?
+    var afterModes: (() -> Void)?
     var afterVerify: (() -> Void)?
     var recoverOnConnection: Int?
     var visualError: AppFailure?
+    var visualErrorsByID: [UInt32: AppFailure] = [:]
     var rotationError: AppFailure?
+    var modeErrors: [String: AppFailure] = [:]
+    var disableErrors: [String: AppFailure] = [:]
     var result: [String]?
     lazy var application = PresetApplication(dependencies: .init(
         displays: { [unowned self] includeModes in
@@ -48,6 +53,7 @@ private final class Fixture {
             return self.displays
         },
         setEnabled: { [unowned self] enabled, identity in
+            if !enabled, let error = self.disableErrors[identity] { return .failure(error) }
             if enabled {
                 self.connectionCalls += 1
                 self.enabledRequests.append(identity)
@@ -66,25 +72,27 @@ private final class Fixture {
         setModes: { [unowned self] requests in
             if !requests.isEmpty { self.modeRequests.append((self.elapsed, requests.map(\.identity))) }
             for request in requests {
+                if self.modeErrors[request.identity] != nil { continue }
                 guard let index = self.displays.firstIndex(where: { $0.identity == request.identity }) else { continue }
                 let current = self.displays[index]
                 self.displays[index] = screen(current.identity, current.id, active: current.active,
                     currentMode: request.mode, availableModes: current.availableModes, rotation: current.rotation)
                 self.events.append("mode:\(request.identity)")
             }
-            return [:]
+            self.afterModes?()
+            return self.modeErrors.filter { identity, _ in requests.contains { $0.identity == identity } }
         },
         setVisual: { [unowned self] brightness, contrast, id, completion in
             self.visualCalls += 1
             self.visualValues.append((id, brightness, contrast))
             self.events.append("visual:\(id)")
             self.beforeVisual?()
-            completion(self.visualError.map { .failure($0) } ?? .success(()))
+            completion((self.visualErrorsByID[id] ?? self.visualError).map { .failure($0) } ?? .success(()))
         },
         verifyVisual: { [unowned self] brightness, contrast, id, completion in
             self.verifiedVisualValues.append((id, brightness, contrast))
             self.afterVerify?()
-            completion(self.visualError.map { .failure($0) } ?? .success(()))
+            completion((self.visualErrorsByID[id] ?? self.visualError).map { .failure($0) } ?? .success(()))
         },
         schedule: { [unowned self] delay, action in
             self.jobs.append { [unowned self] in self.elapsed += delay; action() }
@@ -92,7 +100,7 @@ private final class Fixture {
         setRotation: { [unowned self] rotation, identity, completion in
             self.rotationRequests.append((rotation, identity))
             self.events.append("rotation:\(identity)")
-            if let error = self.rotationError { completion(.failure(error)); return }
+            if let error = self.rotationError { self.afterFailedRotation?(); completion(.failure(error)); return }
             guard let index = self.displays.firstIndex(where: { $0.identity == identity && $0.active }) else {
                 completion(.failure(AppFailure(message: "旋转目标未连接"))); return
             }
@@ -210,10 +218,10 @@ private enum PresetApplicationTests {
             f.displays[0] = screen("a", 1, currentMode: temporary, availableModes: [temporary])
             f.start(); f.drain()
             expect(f.modeRequests.isEmpty, "an unavailable saved mode must not be replaced by another mode")
-            expect(f.displays.first { $0.identity == "spare" }!.active, "retain useful screens when a saved mode cannot be restored")
+            expect(!f.displays.first { $0.identity == "spare" }!.active, "a mode failure does not cancel a requested disconnection when all targets are connected")
             expect(f.result?.contains { $0.contains("找不到完全匹配") } == true, "unavailable saved mode reported after bounded retries")
-            expect(f.result?.contains { $0.contains("暂缓断开") } == true, "explain why the spare screen was retained")
-            expect(f.visualCalls == 0, "unavailable geometry must not dim any target")
+            expect(f.result?.contains { $0.contains("部分完成") } == true, "report geometry failure separately from completed visual settings")
+            expect(f.visualCalls == 2 && f.verifiedVisualValues.count == 2, "unavailable geometry does not cancel independent visual settings")
         }
         do {
             let f = Fixture(); f.displays.removeAll { $0.identity == "a" }
@@ -223,20 +231,30 @@ private enum PresetApplicationTests {
             expect(f.visualCalls == 0, "partial target recovery must not change brightness")
         }
         portraitRotationSurvivesDisconnect()
-        legacyDirectionIsLearnedBeforeDisconnect()
+        followCurrentAllowsNaturalDirectionChanges()
         sleepAndWorkRoundTrip()
         brightnessOnlyPresetAllowsOrientationChanges()
-        failedRotationRestoresDisconnectedScreen()
-        unavailableModeAfterDisconnectRestoresScreen()
+        failedRotationDoesNotBlockOtherSettings()
+        unavailableModeAfterDisconnectDoesNotBlockVisual()
         delayedModesAfterRotationRecover()
         let identified = DisplayInfo(id: 1, name: "Display", active: true, builtin: false,
             identity: "uuid:restored", currentMode: mode, availableModes: [mode], legacyIdentity: "external-1-2-123")
         expect(DisplayIdentity.migrationTarget(for: "hardware:external-1-2-123", displays: [identified]) == "uuid:restored", "temporary hardware identity upgrades to UUID")
         legacyBlackoutIgnoresUnavailableGeometry()
-        explicitBlackoutIgnoresUnavailableGeometry()
-        mixedPresetFailurePreventsBlackout()
+        explicitBlackoutAppliesGeometry()
+        mixedPresetGeometryFailureDoesNotBlockBlackout()
         topologyChangesBeforeVisualAreRejected()
-        print("PresetApplication: 23 regression scenarios and hardware identity upgrade passed")
+        alreadyMatchedPresetsSkipSettling()
+        licenseFailureIsNotRetried()
+        naturalRecoveryClearsLicenseFailure()
+        oppositePortraitAnglesRemainDistinct()
+        exactModeAppliesDespiteRotationFailure()
+        modeWriteFailureDoesNotBlockVisual()
+        disableFailureDoesNotBlockVisual()
+        visualFailureIsIndependentPerDisplay()
+        connectionLossAfterDisconnectRestoresScreen()
+        identityUncertaintyInvalidatesCompletion()
+        print("PresetApplication: 33 regression scenarios and hardware identity upgrade passed")
     }
 
     private static func legacyBlackoutIgnoresUnavailableGeometry() {
@@ -254,7 +272,7 @@ private enum PresetApplicationTests {
         expect(f.preset.displays[0].mode == portrait, "saved geometry is retained")
     }
 
-    private static func explicitBlackoutIgnoresUnavailableGeometry() {
+    private static func explicitBlackoutAppliesGeometry() {
         let f = Fixture()
         let saved = DisplayModeInfo(width: 1600, height: 900, pixelWidth: 1600, pixelHeight: 900, refreshRate: 60)
         let current = DisplayModeInfo(width: 1152, height: 2048, pixelWidth: 2304, pixelHeight: 4096, refreshRate: 60)
@@ -267,13 +285,12 @@ private enum PresetApplicationTests {
         f.preset.displays[0].applyGeometry = true
         f.preset.displays[0].contrast = -0.9
         let original = f.preset
-        f.rotationError = AppFailure(message: "BetterDisplay 拒绝了请求：Pro required.")
         f.start(); f.drain()
-        expect(f.result == [], "the reported blackout succeeds despite explicit geometry, a rotated screen and unavailable landscape mode")
-        expect(f.rotationRequests.isEmpty && f.modeRequests.isEmpty, "blackout never reaches rotation or resolution commands")
-        expect(f.events == ["disable:DELL U2720QM", "visual:1"], "disconnect Dell before blackening Philips")
-        expect(f.displays[1].active == false && f.displays[0].rotation == 270 && f.displays[0].currentMode == current,
-               "blackout disconnects Dell without altering the current Philips geometry")
+        expect(f.result == [], "explicit blackout geometry remains an independent request")
+        expect(f.rotationRequests.count == 1 && f.modeRequests.count == 1, "explicit blackout applies the requested rotation and exact mode")
+        expect(f.events == ["rotation:27B1N3800", "mode:27B1N3800", "disable:DELL U2720QM", "visual:1"], "apply geometry, disconnect Dell, then blacken Philips")
+        expect(f.displays[1].active == false && f.displays[0].rotation == 0 && f.displays[0].currentMode == saved,
+               "explicit blackout preserves the requested final geometry")
         expect(f.visualValues.count == 1 && f.visualValues[0].displayID == 1
                && f.visualValues[0].brightness == 0 && f.visualValues[0].contrast == -0.9,
                "apply the saved blackout brightness and contrast")
@@ -281,39 +298,150 @@ private enum PresetApplicationTests {
                "verify both saved visual settings before reporting success")
         expect(f.preset == original && f.preset.displays[0].applyGeometry == true, "preserve all saved fields including the explicit geometry choice")
         expect(PresetApplication.configurationErrors(for: f.preset, displays: f.displays).isEmpty,
-               "menu verification uses blackout semantics despite mismatched saved geometry")
+               "menu verification accepts all explicitly requested blackout settings")
     }
 
-    private static func mixedPresetFailurePreventsBlackout() {
+    private static func mixedPresetGeometryFailureDoesNotBlockBlackout() {
         let f = Fixture()
         f.preset.displays[0].brightness = 0
-        f.preset.displays[0].applyGeometry = true
+        f.preset.displays[0].applyGeometry = false
         f.preset.displays[0].rotation = 90
         f.preset.displays[1].rotation = 90
         f.preset.displays[1].mode = transposed(mode)
         f.rotationError = AppFailure(message: "Pro required.")
         f.start(); f.drain()
-        expect(f.result?.contains { $0.contains("b：Pro required.") } == true,
+        expect(f.result?.contains { $0.contains("b：") && $0.contains("Pro required.") } == true,
                "the nonzero-brightness target retains strict rotation failure reporting")
-        expect(f.result?.filter { $0.hasPrefix("b：") }.count == 1
-               && f.result?.contains { $0.contains("找不到完全匹配") } == false,
-               "report the rotation cause once without a cascading unavailable-mode error")
+        expect(f.result?.filter { $0.hasPrefix("b：") }.count == 2,
+               "report both independently requested rotation and exact mode failures")
         expect(!f.rotationRequests.isEmpty && f.rotationRequests.allSatisfy { $0.identity == "b" },
                "only the nonzero-brightness target requests rotation in a mixed preset")
-        expect(f.visualCalls == 0, "failure of a visible target prevents blackening another target")
-        expect(f.displays.first { $0.identity == "spare" }!.active, "retain the spare display while the visible target is unready")
+        expect(f.visualCalls == 2 && f.verifiedVisualValues.count == 2, "geometry failure does not cancel either target's visual settings")
+        expect(!f.displays.first { $0.identity == "spare" }!.active, "connected visible targets allow the requested spare disconnection")
     }
 
     private static func topologyChangesBeforeVisualAreRejected() {
         let f = Fixture()
         f.preset.displays.removeAll { !$0.enabled }
         f.displays.removeAll { $0.identity == "spare" }
-        f.beforeSnapshot = { _ in
-            if f.elapsed >= 3.2 { f.displays.removeAll { $0.identity == "a" } }
-        }
+        f.afterModes = { f.displays.removeAll { $0.identity == "a" } }
         f.start(); f.drain()
         expect(f.result?.isEmpty == false, "late target disappearance prevents successful application")
         expect(f.visualCalls == 0, "recheck all targets immediately before visual changes")
+    }
+
+    private static func alreadyMatchedPresetsSkipSettling() {
+        let f = Fixture()
+        f.preset.displays.removeAll { !$0.enabled }
+        f.displays.removeAll { $0.identity == "spare" }
+        f.start(); f.drain()
+        expect(f.result == [] && f.elapsed < 0.5, "already-matched topology and geometry skip empty settling delays")
+        expect(f.connectionCalls == 0 && f.modeRequests.isEmpty && f.rotationRequests.isEmpty, "fast path does not reconfigure matched displays")
+        expect(f.visualValues.count == 2 && f.verifiedVisualValues.count == 2, "fast path still sets and verifies every target's visual settings")
+        let failed = Fixture()
+        failed.preset.displays.removeAll { !$0.enabled }
+        failed.displays.removeAll { $0.identity == "spare" }
+        failed.visualError = AppFailure(message: "readback mismatch")
+        failed.start(); failed.drain()
+        expect(failed.result?.contains { $0.contains("readback mismatch") } == true, "fast path cannot hide visual readback failures")
+    }
+
+    private static func licenseFailureIsNotRetried() {
+        let f = rotationFixture()
+        f.rotationError = AppFailure(message: "Pro required.", reason: .requiresPro)
+        f.start(); f.drain()
+        expect(f.rotationRequests.count == 1, "an explicit license rejection is not sent six times")
+        expect(f.result?.contains { $0.contains("Pro required.") } == true && f.visualCalls == 1, "license failure preserves its error while visual settings continue")
+        expect(!f.displays[1].active && f.enabledRequests.isEmpty, "geometry rejection does not undo an otherwise completed disconnection")
+    }
+
+    private static func naturalRecoveryClearsLicenseFailure() {
+        let f = rotationFixture()
+        f.rotationError = AppFailure(message: "Pro required.", reason: .requiresPro)
+        f.afterFailedRotation = {
+            f.jobs.append { f.displays[0] = screen("Philips", 1, currentMode: portrait, availableModes: [portrait], rotation: 90) }
+        }
+        f.start(); f.drain()
+        expect(f.result == [] && f.rotationRequests.count == 1 && f.visualCalls == 1, "a fresh matching state can recover despite an earlier license rejection")
+    }
+
+    private static func oppositePortraitAnglesRemainDistinct() {
+        let f = rotationFixture(rotation: 270)
+        f.afterDisable = nil
+        f.rotationError = AppFailure(message: "Pro required.", reason: .requiresPro)
+        f.start(); f.drain()
+        expect(f.result?.contains { $0.contains("预设旋转 90°，当前 270°") } == true, "equal portrait resolutions do not make opposite rotation angles equivalent")
+        expect(f.rotationRequests.count == 1 && f.visualCalls == 1 && !f.displays[1].active, "opposite-angle failure does not cancel connection and visual settings")
+    }
+
+    private static func exactModeAppliesDespiteRotationFailure() {
+        let f = rotationFixture(rotation: 270)
+        let temporary = DisplayModeInfo(width: 720, height: 1280, pixelWidth: 720, pixelHeight: 1280, refreshRate: 60)
+        f.displays[0] = screen("Philips", 1, currentMode: temporary, availableModes: [temporary, portrait], rotation: 270)
+        f.afterDisable = nil
+        f.rotationError = AppFailure(message: "Pro required.", reason: .requiresPro)
+        f.start(); f.drain()
+        expect(f.rotationRequests.count == 1 && f.modeRequests.count == 1, "a denied rotation does not prevent a currently available exact resolution")
+        expect(f.displays[0].currentMode == portrait && f.displays[0].rotation == 270, "mode and rotation remain distinct settings")
+        expect(f.visualCalls == 1 && f.verifiedVisualValues.count == 1, "independent mode and visual settings complete")
+        expect(f.result?.contains { $0.contains("预设旋转 90°，当前 270°") } == true
+               && f.result?.contains { $0.contains("分辨率") } == false, "report only the setting that still differs")
+    }
+
+    private static func modeWriteFailureDoesNotBlockVisual() {
+        let f = Fixture()
+        f.preset.displays.removeAll { !$0.enabled }
+        f.displays.removeAll { $0.identity == "spare" }
+        let temporary = DisplayModeInfo(width: 1280, height: 720, pixelWidth: 1280, pixelHeight: 720, refreshRate: 60)
+        f.displays[0] = screen("a", 1, currentMode: temporary, availableModes: [temporary, mode])
+        f.modeErrors["a"] = AppFailure(message: "mode write rejected")
+        f.start(); f.drain()
+        expect(f.modeRequests.count == 6, "transient mode failures retain bounded retries")
+        expect(f.result?.contains { $0.contains("a：mode write rejected") } == true, "preserve the actual mode failure")
+        expect(f.visualValues.count == 2 && f.verifiedVisualValues.count == 2, "both targets receive and verify visual settings after a mode error")
+        expect(f.result?.contains { $0.contains("部分完成") } == true && !f.application.isRunning, "partial completion releases the application lock")
+    }
+
+    private static func disableFailureDoesNotBlockVisual() {
+        let f = Fixture()
+        f.disableErrors["spare"] = AppFailure(message: "disconnect rejected")
+        f.start(); f.drain()
+        expect(f.result?.contains { $0.contains("spare：disconnect rejected") } == true, "preserve the actual disconnection failure")
+        expect(f.displays.first { $0.identity == "spare" }!.active, "a rejected disconnection remains accurately reported")
+        expect(f.visualValues.count == 2 && f.verifiedVisualValues.count == 2, "disconnection rejection does not block the connected targets' visual settings")
+        expect(f.result?.contains { $0.contains("已停止调整") } == false, "never claim visual settings were stopped after applying them")
+    }
+
+    private static func visualFailureIsIndependentPerDisplay() {
+        let f = Fixture()
+        f.visualErrorsByID[1] = AppFailure(message: "visual readback rejected")
+        f.start(); f.drain()
+        expect(f.result?.contains { $0.contains("a：visual readback rejected") } == true, "one visual failure is retained")
+        expect(f.verifiedVisualValues.contains { $0.displayID == 2 }, "the other display is still verified")
+        expect(f.result?.contains { $0.contains("部分完成：b的亮度和对比度已应用并确认") } == true, "claim partial visual success only for the verified target")
+        expect(!f.displays.first { $0.identity == "spare" }!.active, "an independent visual error does not misreport a completed disconnection")
+    }
+
+    private static func connectionLossAfterDisconnectRestoresScreen() {
+        let f = rotationFixture()
+        f.afterDisable = { f.displays.removeAll { $0.identity == "Philips" } }
+        f.start(); f.drain()
+        expect(f.visualCalls == 0, "missing target identity still prevents visual writes")
+        expect(f.displays.first { $0.identity == "Dell" }!.active && f.enabledRequests.contains("Dell"), "connection loss restores the screen disconnected by this operation")
+        expect(f.result?.contains { $0.contains("已请求重新连接") } == true, "connection safety recovery is explained")
+        expect(!f.application.isRunning, "connection recovery failure completes within its retry bound")
+    }
+
+    private static func identityUncertaintyInvalidatesCompletion() {
+        let f = Fixture()
+        f.afterVerify = {
+            f.displays[0] = DisplayInfo(id: 1, name: "a", active: true, builtin: false, identity: "a",
+                                       currentMode: mode, availableModes: [mode], canControl: false, rotation: 0)
+        }
+        f.start(); f.drain()
+        expect(f.result?.contains { $0.contains("a：无法核实显示器身份") } == true, "matching numerical ID cannot validate an uncertain final identity")
+        expect(!PresetApplication.configurationErrors(for: f.preset, displays: f.displays).isEmpty, "menu check also rejects uncertain identity")
+        expect(f.result?.contains { $0.contains("部分完成：b的亮度和对比度已应用并确认") } == true, "partial success excludes the identity that became uncertain")
     }
 
     private static let portrait = DisplayModeInfo(width: 1080, height: 1920, pixelWidth: 1080, pixelHeight: 1920, refreshRate: 60)
@@ -347,16 +475,18 @@ private enum PresetApplicationTests {
         expect(f.visualValues.last?.brightness == 0.5, "positive brightness is applied after geometry is restored")
     }
 
-    private static func legacyDirectionIsLearnedBeforeDisconnect() {
+    private static func followCurrentAllowsNaturalDirectionChanges() {
         let f = rotationFixture(rotation: 270, savedRotation: nil)
+        f.afterDisable = { f.displays[0] = screen("Philips", 1, currentMode: portrait, availableModes: [portrait], rotation: 90) }
         f.start(); f.drain()
-        expect(f.result == [], "a legacy portrait preset can retain a direction seen before disconnection")
-        expect(f.rotationRequests.count == 1 && f.rotationRequests[0].rotation == 270, "do not infer 90 degrees from portrait dimensions")
-        expect(f.displays[0].rotation == 270, "the observed 270-degree orientation is restored")
+        expect(f.result == [], "follow-current accepts the system's new direction after a topology change")
+        expect(f.rotationRequests.isEmpty, "no implicit rotation is learned from an earlier snapshot")
+        expect(f.displays[0].rotation == 90 && f.displays[0].currentMode == portrait, "only the explicit resolution is verified")
     }
 
     private static func sleepAndWorkRoundTrip() {
         let f = rotationFixture(brightness: 0)
+        f.preset.displays[0].applyGeometry = false
         f.start(); f.drain()
         expect(f.result == [] && !f.displays[1].active && f.visualValues.last?.brightness == 0, "complete sleep preset")
         expect(f.rotationRequests.isEmpty && f.modeRequests.isEmpty, "sleep applies zero brightness without restoring geometry")
@@ -386,19 +516,19 @@ private enum PresetApplicationTests {
         expect(f.modeRequests.isEmpty && f.rotationRequests.isEmpty && f.visualCalls == 1, "brightness-only preset operates only on connection and visual settings")
     }
 
-    private static func failedRotationRestoresDisconnectedScreen() {
+    private static func failedRotationDoesNotBlockOtherSettings() {
         let f = rotationFixture()
         f.rotationError = AppFailure(message: "旋转不可用")
         f.start(); f.drain()
         expect(f.result?.contains { $0.contains("旋转不可用") } == true, "report the actual rotation failure")
         expect(f.rotationRequests.count == 6, "rotation retries are bounded")
-        expect(f.visualCalls == 0, "failed rotation never reaches visual adjustments")
-        expect(f.displays[1].active && f.enabledRequests == ["Dell"], "reconnect the screen disconnected by this attempt")
-        expect(f.result?.contains { $0.contains("已请求重新连接") } == true, "explain the connection recovery")
+        expect(f.visualCalls == 1 && f.verifiedVisualValues.count == 1, "failed rotation still applies and verifies visual settings")
+        expect(!f.displays[1].active && f.enabledRequests.isEmpty, "completed connections are retained despite a geometry failure")
+        expect(f.result?.contains { $0.contains("部分完成") && $0.contains("亮度和对比度已应用并确认") } == true, "report which settings completed")
         expect(!f.application.isRunning, "failure releases the application lock")
     }
 
-    private static func unavailableModeAfterDisconnectRestoresScreen() {
+    private static func unavailableModeAfterDisconnectDoesNotBlockVisual() {
         let f = rotationFixture()
         let temporary = DisplayModeInfo(width: 720, height: 1280, pixelWidth: 720, pixelHeight: 1280, refreshRate: 60)
         f.afterRotation = {
@@ -406,8 +536,8 @@ private enum PresetApplicationTests {
         }
         f.start(); f.drain()
         expect(f.result?.contains { $0.contains("找不到完全匹配") } == true, "mode disappearance after rotation is reported")
-        expect(f.modeRequests.isEmpty && f.visualCalls == 0, "do not choose an approximate mode or dim after geometry failure")
-        expect(f.displays[1].active && f.enabledRequests == ["Dell"], "mode failure also reconnects the previously disabled display")
+        expect(f.modeRequests.isEmpty && f.visualCalls == 1, "never choose an approximate mode, but continue independent visual settings")
+        expect(!f.displays[1].active && f.enabledRequests.isEmpty, "mode failure does not undo requested connections")
         expect(f.elapsed < 35 && !f.application.isRunning, "unavailable mode finishes after bounded retries")
     }
 

@@ -52,27 +52,7 @@ struct BetterDisplayBridgeTests {
         simultaneousRequestsRemainIndependent()
         mismatchRetriesAreBounded()
         invalidValuesDoNotSend()
-        matchingRotationDoesNotSet()
-        rotationWaitsForReadBack()
-        rotationMismatchRetriesAreBounded()
-        invalidRotationsDoNotSend()
-        rotationReadAndSetFailuresStop()
-        recycledDisplayDoesNotRotate()
-        print("BetterDisplayBridgeTests: 13 scenarios passed")
-    }
-
-    private static func recycledDisplayDoesNotRotate() {
-        let transport = FakeTransport()
-        let bridge = BetterDisplayBridge(transport: transport)
-        var current = true
-        var error: String?
-        bridge.setRotation(rotation: 90, displayID: 42, isCurrentDisplay: { current }) {
-            if case .failure(let failure) = $0 { error = failure.message }
-        }
-        current = false
-        transport.reply(to: 0, result: true, payload: "0")
-        precondition(error?.contains("身份已变化") == true)
-        precondition(transport.requests.count == 1, "never rotate a recycled ID after the asynchronous read")
+        print("BetterDisplayBridgeTests: 7 scenarios passed")
     }
 
     private static func missingDependencyDoesNotSend() {
@@ -120,21 +100,32 @@ struct BetterDisplayBridgeTests {
     }
 
     private static func rejectionAndMalformedResponsesFail() {
-        for scenario in 0..<4 {
+        for scenario in 0..<6 {
             let transport = FakeTransport()
             let bridge = BetterDisplayBridge(transport: transport)
             var error: String?
-            bridge.verifyVisualSettings(brightness: 0.5, contrast: 0, displayID: 1) {
-                if case .failure(let failure) = $0 { error = failure.message }
+            var reason: AppFailure.Reason?
+            let completion: (Result<Void, AppFailure>) -> Void = {
+                if case .failure(let failure) = $0 { error = failure.message; reason = failure.reason }
+            }
+            if scenario == 5 {
+                bridge.setVisualSettings(brightness: 0.5, contrast: 0, displayID: 1, completion: completion)
+            } else {
+                bridge.verifyVisualSettings(brightness: 0.5, contrast: 0, displayID: 1, completion: completion)
             }
             switch scenario {
             case 0: transport.reply(to: 0, result: false, payload: "Feature unavailable")
             case 1: transport.reply(to: 0, result: nil)
             case 2: transport.reply(to: 0, result: true, payload: "nan")
-            default: transport.reply(to: 0, result: true, payload: "")
+            case 3: transport.reply(to: 0, result: true, payload: "")
+            default: transport.reply(to: 0, result: false, payload: "Pro required.")
             }
-            precondition(error != nil && transport.timers.isEmpty)
+            precondition(error != nil && transport.timers.isEmpty && transport.requests.count == 1)
             if scenario == 0 { precondition(error!.contains("Feature unavailable")) }
+            if scenario >= 4 {
+                precondition(error!.contains("Pro required.") && reason == .requiresPro,
+                             "visual get and set rejections preserve the generic machine-readable reason")
+            }
         }
     }
 
@@ -207,114 +198,4 @@ struct BetterDisplayBridgeTests {
         precondition(transport.requests.isEmpty)
     }
 
-    private static func matchingRotationDoesNotSet() {
-        for rotation in [0, 90, 180, 270] {
-            let transport = FakeTransport()
-            let bridge = BetterDisplayBridge(transport: transport)
-            var finished = false
-            bridge.setRotation(rotation: rotation, displayID: 42) {
-                guard case .success = $0 else { preconditionFailure("Expected unchanged rotation to succeed") }
-                finished = true
-            }
-            precondition(!finished)
-            precondition(transport.requests[0]["commands"] as? [String] == ["get"])
-            let read = transport.requests[0]["parameters"] as! [String: Any]
-            precondition(read["displayID"] as? String == "42" && read["rotation"] is NSNull)
-            transport.reply(to: 0, result: true, payload: "\(rotation)\n")
-            precondition(finished && transport.requests.count == 1 && transport.timers.isEmpty)
-        }
-    }
-
-    private static func rotationWaitsForReadBack() {
-        let transport = FakeTransport()
-        let bridge = BetterDisplayBridge(transport: transport)
-        var completions = 0
-        bridge.setRotation(rotation: 90, displayID: 42) {
-            precondition(Thread.isMainThread)
-            guard case .success = $0 else { preconditionFailure("Expected verified rotation") }
-            completions += 1
-        }
-        transport.reply(to: 0, result: true, payload: "0")
-        precondition(transport.requests[1]["commands"] as? [String] == ["set"])
-        let set = transport.requests[1]["parameters"] as! [String: Any]
-        precondition(set["displayID"] as? String == "42" && set["rotation"] as? String == "90")
-        transport.reply(to: 1, result: true)
-        precondition(completions == 0)
-        transport.reply(to: 2, result: true, payload: "0")
-        precondition(completions == 0 && transport.requests.count == 3)
-        transport.fireTimers(lessThan: 1)
-        transport.reply(to: 3, result: true, payload: "90.0")
-        precondition(completions == 1 && transport.timers.isEmpty)
-        transport.reply(to: 3, result: true, payload: "90.0")
-        precondition(completions == 1)
-    }
-
-    private static func rotationMismatchRetriesAreBounded() {
-        let transport = FakeTransport()
-        let bridge = BetterDisplayBridge(transport: transport)
-        var error: String?
-        bridge.verifyRotation(rotation: 90, displayID: 42) {
-            if case .failure(let failure) = $0 { error = failure.message }
-        }
-        for pass in 0..<3 {
-            transport.reply(to: pass, result: true, payload: "0")
-            if pass < 2 {
-                precondition(error == nil)
-                transport.fireTimers(lessThan: 1)
-            }
-        }
-        precondition(error?.contains("旋转角度目标 90°") == true)
-        precondition(transport.requests.count == 3 && transport.timers.isEmpty)
-    }
-
-    private static func invalidRotationsDoNotSend() {
-        let transport = FakeTransport()
-        let bridge = BetterDisplayBridge(transport: transport)
-        for rotation in [-90, 45, 360, Int.max] {
-            var failures = 0
-            let completion: (Result<Void, AppFailure>) -> Void = {
-                if case .failure(let failure) = $0 {
-                    precondition(failure.message.contains("旋转角度无效"))
-                    failures += 1
-                }
-            }
-            bridge.setRotation(rotation: rotation, displayID: 42, completion: completion)
-            bridge.verifyRotation(rotation: rotation, displayID: 42, completion: completion)
-            precondition(failures == 2)
-        }
-        precondition(transport.requests.isEmpty)
-    }
-
-    private static func rotationReadAndSetFailuresStop() {
-        for scenario in 0..<6 {
-            let transport = FakeTransport()
-            let bridge = BetterDisplayBridge(transport: transport)
-            var error: String?
-            bridge.setRotation(rotation: 90, displayID: 42) {
-                if case .failure(let failure) = $0 { error = failure.message }
-            }
-            switch scenario {
-            case 0: transport.reply(to: 0, result: false, payload: "Feature unavailable")
-            case 1: transport.reply(to: 0, result: true, payload: "nan")
-            case 2:
-                transport.reply(to: 0, result: true, payload: "0")
-                transport.reply(to: 1, result: false, payload: "Feature unavailable")
-            case 3: transport.reply(to: 0, result: false, payload: "Pro required.")
-            case 4:
-                transport.reply(to: 0, result: true, payload: "0")
-                transport.reply(to: 1, result: false, payload: "Pro required.")
-            default:
-                transport.reply(to: 0, result: true, payload: "0")
-                transport.reply(to: 1, result: true)
-                transport.reply(to: 2, result: false, payload: "Pro required.")
-            }
-            precondition(error != nil && transport.timers.isEmpty)
-            precondition(transport.requests.count == [1, 1, 2, 1, 2, 3][scenario])
-            if scenario == 1 { precondition(error!.contains("旋转角度数值")) }
-            if scenario >= 3 {
-                precondition(error!.contains("旋转控制需要 BetterDisplay Pro") && error!.contains("跟随当前"),
-                             "rotation license failures explain the feature and available preset choices")
-            }
-        }
-    }
 }

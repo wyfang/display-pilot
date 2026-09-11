@@ -319,8 +319,8 @@ struct DisplayCoreTests {
                            "rotation preserves exact mode on inverse and half turns")
             try coreExpect(!portrait.hasSameOrientation(as: coreMode), "portrait and landscape are distinct")
         }
-        // V4 acquires only a matching live angle. V5 nil explicitly means
-        // follow-current and must never be silently converted to a fixed angle.
+        // Legacy presets never requested rotation. Migration must preserve that
+        // behavior even when the current orientation matches their saved mode.
         do {
             let defaults = CoreMemoryPreferences()
             let landscape = coreEntry("uuid:screen")
@@ -333,8 +333,8 @@ struct DisplayCoreTests {
                                       currentMode: coreMode, availableModes: [coreMode], rotation: 180)
             let store = PresetStore(defaults: defaults)
             let migrated = store.load(displays: [display])
-            try coreExpect(migrated.presetA.displays[0].rotation == 180 && migrated.presetB.displays[0].rotation == nil,
-                           "learn only a live angle whose mode orientation matches the saved mode")
+            try coreExpect(migrated.presetA.displays[0].rotation == nil && migrated.presetB.displays[0].rotation == nil,
+                           "migration must not turn the observed angle into a new rotation requirement")
             try coreExpect(migrated.presetA.displays[0].mode == landscape.mode && migrated.presetB.displays[0].mode == portrait.mode,
                            "rotation migration never alters saved resolution or backing dimensions")
             try coreExpect(defaults.data(forKey: "displayPresetsV4") == bytes && defaults.data(forKey: "displayPresetsV5") != nil,
@@ -351,7 +351,7 @@ struct DisplayCoreTests {
             let display = DisplayInfo(id: 1, name: "Portrait", active: true, builtin: false, identity: "uuid:portrait",
                                       currentMode: portrait, availableModes: [portrait], rotation: 270)
             let stored = PresetStore(defaults: defaults).load(displays: [display])
-            try coreExpect(stored.presetA.displays[0].rotation == 270, "new presets record the actual angle instead of guessing 90")
+            try coreExpect(stored.presetA.displays[0].rotation == nil, "new presets follow current rotation until an angle is explicitly chosen")
             let conflicts = DisplayIdentity.protectConflicts([display, display])
             try coreExpect(conflicts.allSatisfy { $0.rotation == 270 && !$0.canControl }, "identity protection copies rotation metadata")
             let backend = CoreFakeBackend()
@@ -360,8 +360,8 @@ struct DisplayCoreTests {
             let remembered = DisplayController(defaults: defaults, backend: backend).displays(includeModes: false)
             try coreExpect(remembered.first?.rotation == 270, "remembered display resolution retains fresh rotation")
         }
-        // Blackout suspends geometry even for an explicit stored true. The
-        // stored choice, exact mode and angle remain available after brightening.
+        // Explicit geometry remains independent of brightness. Old blackout
+        // data without a geometry choice keeps its existing default.
         do {
             for preference in [nil, true, false] as [Bool?] {
                 var original = coreEntry("uuid:blackout", brightness: 0, contrast: -0.9)
@@ -370,8 +370,11 @@ struct DisplayCoreTests {
                 let bytes = try JSONEncoder().encode(original)
                 let restored = try JSONDecoder().decode(DisplayPresetEntry.self, from: bytes)
                 try coreExpect(restored == original, "JSON roundtrip preserves every blackout field and optional geometry choice")
-                try coreExpect(!restored.controlsGeometry && restored.requestedMode == nil && restored.requestedRotation == nil,
-                               "zero brightness never requests geometry, including explicit applyGeometry true")
+                let blackoutGeometry = preference ?? false
+                try coreExpect(restored.controlsGeometry == blackoutGeometry
+                               && restored.requestedMode == (blackoutGeometry ? coreMode : nil)
+                               && restored.requestedRotation == (blackoutGeometry ? 270 : nil),
+                               "zero brightness preserves explicit geometry and legacy blackout defaults")
                 var brightened = restored
                 brightened.brightness = 0.65
                 let appliesGeometry = preference ?? true

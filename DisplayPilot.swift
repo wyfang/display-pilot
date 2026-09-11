@@ -152,28 +152,31 @@ final class DisplayPresetRowView: NSBox {
         enabledButton.state = entry.enabled ? .on : .off
         brightnessSlider.doubleValue = entry.brightness * 100
         contrastSlider.doubleValue = entry.contrast * 100
-        brightnessValue.stringValue = "\(Int(brightnessSlider.doubleValue.rounded()))%"
+        let percent = brightnessSlider.doubleValue
+        brightnessValue.stringValue = percent > 0 && percent < 1
+            ? (percent < 0.1 ? "<0.1%" : String(format: "%.1f%%", percent))
+            : "\(Int(percent.rounded()))%"
         let contrast = Int(contrastSlider.doubleValue.rounded())
         contrastValue.stringValue = contrast > 0 ? "+\(contrast)%" : "\(contrast)%"
         brightnessSlider.isEnabled = entry.enabled
         contrastSlider.isEnabled = entry.enabled
         geometryButton.state = entry.controlsGeometry ? .on : .off
-        geometryButton.isEnabled = entry.enabled && entry.brightness > 0
+        geometryButton.isEnabled = entry.enabled
         modePopup.isEnabled = entry.enabled && entry.controlsGeometry
         rotationPopup.isEnabled = entry.enabled && entry.controlsGeometry
         rotationPopup.selectItem(at: entry.rotation.flatMap { DisplayRotation.angles.firstIndex(of: $0).map { $0 + 1 } } ?? 0)
-        if entry.brightness == 0 {
-            rotationHint.stringValue = "亮度为 0 时跳过分辨率与旋转，仅应用连接、亮度和对比度。已保存的显示模式设置会保留，调高亮度后可继续使用。"
-            rotationHint.textColor = .secondaryLabelColor
-        } else if !entry.controlsGeometry {
+        if !entry.controlsGeometry {
             rotationHint.stringValue = "仅调整连接、亮度和对比度；已保存的分辨率与旋转设置仍会保留。"
             rotationHint.textColor = .tertiaryLabelColor
         } else if entry.rotation == nil, let saved = entry.mode, let current = display.currentMode,
            !saved.hasSameOrientation(as: current) {
             rotationHint.stringValue = "已保存分辨率与当前屏幕方向不同，请选择旋转角度；竖屏需明确选择 90° 或 270°。"
             rotationHint.textColor = .systemOrange
+        } else if let target = entry.requestedRotation, let current = display.rotation, target != current {
+            rotationHint.stringValue = "当前旋转 \(current)°，应用预设时将切换为 \(target)°。"
+            rotationHint.textColor = .systemOrange
         } else {
-            rotationHint.stringValue = "跟随当前保留屏幕方向；修改旋转角度需要 BetterDisplay Pro 支持。"
+            rotationHint.stringValue = "“跟随当前”保留系统方向；指定角度时由 macOS 旋转显示器。"
             rotationHint.textColor = .tertiaryLabelColor
         }
     }
@@ -189,6 +192,9 @@ final class DisplayPresetRowView: NSBox {
     }
 
     @objc private func brightnessChanged() {
+        // Make the visible integer percentage the value actually saved. Older
+        // fractional preferences remain untouched until the slider is edited.
+        brightnessSlider.doubleValue = brightnessSlider.doubleValue.rounded()
         entry.brightness = brightnessSlider.doubleValue / 100
         publishChange()
     }
@@ -450,6 +456,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let displayController = DisplayController()
     private let presetStore = PresetStore()
     private let betterDisplay = BetterDisplayBridge()
+    private lazy var nativeRotation = NativeDisplayRotation(resolve: { [unowned self] identity in
+        self.displayController.resolveDisplay(identity: identity)
+    })
     private var statusItem: NSStatusItem!
     private var presetWindow: PresetWindowController!
     private var applyingPreset = false
@@ -467,14 +476,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         },
         schedule: { delay, action in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action) },
         setRotation: { [unowned self] rotation, identity, completion in
-            guard let display = self.displayController.resolveDisplay(identity: identity), display.active else {
-                completion(.failure(AppFailure(message: "无法核实旋转目标显示器，或显示器尚未连接。")))
-                return
-            }
-            self.betterDisplay.setRotation(rotation: rotation, displayID: display.id, isCurrentDisplay: { [weak self] in
-                guard let current = self?.displayController.resolveDisplay(identity: identity) else { return false }
-                return current.active && current.id == display.id
-            }, completion: completion)
+            self.nativeRotation.setRotation(rotation: rotation, identity: identity, completion: completion)
         }
     ))
 
