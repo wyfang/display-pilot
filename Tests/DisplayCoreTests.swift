@@ -386,6 +386,52 @@ struct DisplayCoreTests {
                 try coreExpect(brightened == original, "brightness roundtrip does not rewrite saved geometry or contrast")
             }
         }
-        print("DisplayCore: 20 regression scenarios passed")
+        try presetStartDelay()
+        print("DisplayCore: 21 regression scenarios passed")
+    }
+
+    private static func presetStartDelay() throws {
+        let defaults = CoreMemoryPreferences()
+        var time = 20.0
+        var timer: (() -> Void)?
+        var nextInterval: TimeInterval = 0
+        let delay = PresetStartDelay(defaults: defaults, now: { time }, schedule: { interval, tick in
+            timer = tick
+            nextInterval = interval
+            return { timer = nil }
+        })
+        var actions: [String] = []
+        var observed: [Int] = []
+        delay.onChange = { [weak delay] in observed.append(delay?.remainingSeconds ?? -1) }
+
+        try coreExpect(delay.seconds == 0 && delay.start { actions.append("immediate") }, "old preferences default to immediate")
+        try coreExpect(actions == ["immediate"] && !delay.isPending && timer == nil, "immediate action runs inline without scheduling")
+        delay.seconds = 100
+        try coreExpect(PresetStartDelay(defaults: defaults).seconds == 60, "stored delay is bounded and survives reload")
+        delay.seconds = -3
+        try coreExpect(delay.seconds == 0, "negative delay is clamped to zero")
+
+        delay.seconds = 5
+        delay.start { actions.append("first") }
+        let cancelledTick = timer
+        try coreExpect(delay.isPending && observed == [5] && nextInterval == 1, "countdown starts without applying a preset")
+        try coreExpect(!delay.start { actions.append("duplicate") }, "a pending countdown rejects duplicate starts")
+        delay.cancel()
+        try coreExpect(!delay.isPending && timer == nil && observed == [5, 0], "cancelling invalidates the timer and updates the menu")
+
+        delay.start { actions.append("second") }
+        delay.seconds = 1
+        cancelledTick?()
+        try coreExpect(observed == [5, 0, 5] && nextInterval == 1, "a stale callback cannot affect the next countdown")
+        time += 3.25
+        timer?()
+        try coreExpect(delay.remainingSeconds == 2 && nextInterval == 0.75, "late ticks use the original deadline")
+        let lastTick = timer
+        time += 4
+        lastTick?()
+        lastTick?()
+        delay.cancel()
+        try coreExpect(actions == ["immediate", "second"] && observed == [5, 0, 5, 2, 0],
+                       "a delayed callback runs exactly once and cancellation after completion is a no-op")
     }
 }

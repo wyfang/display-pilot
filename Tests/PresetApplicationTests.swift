@@ -30,8 +30,12 @@ private final class Fixture {
     var rotationRequests: [(rotation: Int, identity: String)] = []
     var enabledRequests: [String] = []
     var events: [String] = []
-    var visualValues: [(displayID: UInt32, brightness: Double, contrast: Double)] = []
-    var verifiedVisualValues: [(displayID: UInt32, brightness: Double, contrast: Double)] = []
+    var visualValues: [(displayID: UInt32, brightness: Double, contrast: Double, fields: Set<VisualField>)] = []
+    var verifiedVisualValues: [(displayID: UInt32, brightness: Double, contrast: Double, time: TimeInterval)] = []
+    var readSequence: [UInt32: [VisualValues]] = [:]
+    var deviceValues: [UInt32: VisualValues] = [:]
+    var holdWrites = false
+    var acknowledgements: [() -> Void] = []
     var beforeSnapshot: ((Bool) -> Void)?
     var beforeVisual: (() -> Void)?
     var afterDisable: (() -> Void)?
@@ -41,8 +45,8 @@ private final class Fixture {
     var afterModes: (() -> Void)?
     var afterVerify: (() -> Void)?
     var recoverOnConnection: Int?
-    var visualError: AppFailure?
-    var visualErrorsByID: [UInt32: AppFailure] = [:]
+    var writeErrors: [UInt32: AppFailure] = [:]
+    var readErrors: [UInt32: AppFailure] = [:]
     var rotationError: AppFailure?
     var modeErrors: [String: AppFailure] = [:]
     var disableErrors: [String: AppFailure] = [:]
@@ -82,17 +86,32 @@ private final class Fixture {
             self.afterModes?()
             return self.modeErrors.filter { identity, _ in requests.contains { $0.identity == identity } }
         },
-        setVisual: { [unowned self] brightness, contrast, id, completion in
+        setVisual: { [unowned self] values, fields, id, completion in
             self.visualCalls += 1
-            self.visualValues.append((id, brightness, contrast))
+            self.visualValues.append((id, values.brightness, values.contrast, fields))
             self.events.append("visual:\(id)")
             self.beforeVisual?()
-            completion((self.visualErrorsByID[id] ?? self.visualError).map { .failure($0) } ?? .success(()))
+            let error = self.writeErrors[id]
+            if error == nil || error?.reason == .unconfirmed {
+                let previous = self.deviceValues[id] ?? VisualValues(brightness: 0, contrast: 0)
+                self.deviceValues[id] = VisualValues(
+                    brightness: fields.contains(.brightness) ? values.brightness : previous.brightness,
+                    contrast: fields.contains(.contrast) ? values.contrast : previous.contrast
+                )
+            }
+            let acknowledge = { completion(error.map { .failure($0) } ?? .success(())) }
+            if self.holdWrites { self.acknowledgements.append(acknowledge) } else { acknowledge() }
         },
-        verifyVisual: { [unowned self] brightness, contrast, id, completion in
-            self.verifiedVisualValues.append((id, brightness, contrast))
+        readVisual: { [unowned self] id, completion in
+            let values: VisualValues
+            if self.readSequence[id]?.isEmpty == false {
+                values = self.readSequence[id]!.removeFirst()
+            } else {
+                values = self.deviceValues[id] ?? VisualValues(brightness: 0, contrast: 0)
+            }
+            self.verifiedVisualValues.append((id, values.brightness, values.contrast, self.elapsed))
             self.afterVerify?()
-            completion((self.visualErrorsByID[id] ?? self.visualError).map { .failure($0) } ?? .success(()))
+            completion(self.readErrors[id].map { .failure($0) } ?? .success(values))
         },
         schedule: { [unowned self] delay, action in
             self.jobs.append { [unowned self] in self.elapsed += delay; action() }
@@ -115,10 +134,11 @@ private final class Fixture {
         }
     ))
     var preset = DisplayPreset(name: "A", displays: [entry("a", enabled: true), entry("b", enabled: true), entry("spare", enabled: false)])
-    func start() {
+    func start(verifyVisualSettings: Bool = true) {
         result = nil
-        application.apply(preset) { [unowned self] in self.result = $0 }
+        application.apply(preset, verifyVisualSettings: verifyVisualSettings) { [unowned self] in self.result = $0 }
     }
+    func visualCallCount(for id: UInt32) -> Int { visualValues.filter { $0.displayID == id }.count }
     func drain() {
         var count = 0
         while !jobs.isEmpty {
@@ -169,10 +189,12 @@ private enum PresetApplicationTests {
             expect(f.result?.isEmpty == false, "missing all targets reported")
         }
         do {
-            let f = Fixture(); f.visualError = AppFailure(message: "BetterDisplay 超时")
+            let f = Fixture()
+            f.writeErrors[1] = AppFailure(message: "BetterDisplay 超时", reason: .unconfirmed)
+            f.readErrors[1] = AppFailure(message: "亮度无法读回")
             f.start(); f.drain()
-            expect(f.result?.contains { $0.contains("BetterDisplay 超时") } == true, "visual timeout must prevent success")
-            expect(f.visualCalls == 4, "retry visual errors once for two targets")
+            expect(f.result?.contains { $0.contains("BetterDisplay 超时") && $0.contains("亮度无法读回") } == true, "retain both write and verification failures")
+            expect(f.visualValues.map(\.displayID) == [1, 2], "a missing response must never resend either display's write")
         }
         do {
             let f = Fixture()
@@ -252,9 +274,18 @@ private enum PresetApplicationTests {
         modeWriteFailureDoesNotBlockVisual()
         disableFailureDoesNotBlockVisual()
         visualFailureIsIndependentPerDisplay()
+        singleWriteWithoutReadback()
+        verificationResolvesOnlyUnconfirmedWrites()
+        duplicateIdentityRejectedBeforeAnyWrite()
+        readAfterAcknowledgementsSettle()
+        delayedBrightnessNeedsNoCorrection()
+        repairOnlyPersistentFields()
+        finalReadDetectsCrossDisplayChanges()
+        rotatingMismatchDoesNotJustifyAWrite()
+        persistentErrorAndIdentityChangeNeverLoop()
         connectionLossAfterDisconnectRestoresScreen()
         identityUncertaintyInvalidatesCompletion()
-        print("PresetApplication: 33 regression scenarios and hardware identity upgrade passed")
+        print("PresetApplication: topology, geometry, acknowledgements, selective correction and cross-display verification passed")
     }
 
     private static func legacyBlackoutIgnoresUnavailableGeometry() {
@@ -341,7 +372,7 @@ private enum PresetApplicationTests {
         let failed = Fixture()
         failed.preset.displays.removeAll { !$0.enabled }
         failed.displays.removeAll { $0.identity == "spare" }
-        failed.visualError = AppFailure(message: "readback mismatch")
+        failed.readErrors[1] = AppFailure(message: "readback mismatch")
         failed.start(); failed.drain()
         expect(failed.result?.contains { $0.contains("readback mismatch") } == true, "fast path cannot hide visual readback failures")
     }
@@ -414,12 +445,147 @@ private enum PresetApplicationTests {
 
     private static func visualFailureIsIndependentPerDisplay() {
         let f = Fixture()
-        f.visualErrorsByID[1] = AppFailure(message: "visual readback rejected")
+        f.readErrors[1] = AppFailure(message: "visual readback rejected")
         f.start(); f.drain()
         expect(f.result?.contains { $0.contains("a：visual readback rejected") } == true, "one visual failure is retained")
         expect(f.verifiedVisualValues.contains { $0.displayID == 2 }, "the other display is still verified")
         expect(f.result?.contains { $0.contains("部分完成：b的亮度和对比度已应用并确认") } == true, "claim partial visual success only for the verified target")
         expect(!f.displays.first { $0.identity == "spare" }!.active, "an independent visual error does not misreport a completed disconnection")
+    }
+
+    private static func singleWriteWithoutReadback() {
+        let f = Fixture()
+        f.start(verifyVisualSettings: false); f.drain()
+        expect(f.result == [] && f.visualValues.map(\.displayID) == [1, 2], "each active target receives one write")
+        expect(f.verifiedVisualValues.isEmpty, "acknowledgement-only mode never requests visual settings")
+        expect(!f.displays[2].active, "the preset still applies topology")
+
+        let timeout = Fixture()
+        timeout.writeErrors[1] = AppFailure(message: "ACK 超时", reason: .unconfirmed)
+        timeout.start(verifyVisualSettings: false); timeout.drain()
+        expect(timeout.visualValues.map(\.displayID) == [1, 2] && timeout.verifiedVisualValues.isEmpty, "an absent ACK cannot trigger a retry or a read")
+        expect(timeout.result?.contains { $0.contains("a：ACK 超时") } == true, "report an unconfirmed send")
+        expect(timeout.result?.contains { $0.contains("b的亮度和对比度指令已发送") } == true, "report the acknowledged screen accurately")
+
+        let unplugged = Fixture()
+        unplugged.beforeVisual = { unplugged.displays[0] = screen("a", 9) }
+        unplugged.start(verifyVisualSettings: false); unplugged.drain()
+        expect(unplugged.result?.contains { $0.contains("a：显示器编号已变化") } == true, "a late ID change invalidates the acknowledgement")
+    }
+
+    private static func verificationResolvesOnlyUnconfirmedWrites() {
+        let f = Fixture()
+        f.writeErrors[1] = AppFailure(message: "ACK 超时", reason: .unconfirmed)
+        f.start(); f.drain()
+        expect(f.result == [] && f.verifiedVisualValues.map(\.displayID) == [1, 2], "a matching final value resolves a lost acknowledgement")
+        expect(f.visualValues.map(\.displayID) == [1, 2], "neither the slow screen nor its healthy neighbour is rewritten")
+
+        let rejected = Fixture()
+        rejected.writeErrors[1] = AppFailure(message: "Pro required.", reason: .requiresPro)
+        rejected.start(); rejected.drain()
+        expect(rejected.verifiedVisualValues.map(\.displayID) == [2], "do not read a rejected screen or rewrite a healthy one")
+        expect(rejected.visualValues.map(\.displayID) == [1, 2], "a rejection never triggers another write")
+        expect(rejected.result?.contains { $0.contains("a：Pro required.") } == true, "old matching values cannot hide an explicit refusal")
+    }
+
+    private static func readAfterAcknowledgementsSettle() {
+        let f = Fixture()
+        f.preset.displays.removeAll { !$0.enabled }
+        f.holdWrites = true
+        f.start()
+        expect(f.acknowledgements.count == 2 && f.result == nil, "dispatch both first writes before receiving either acknowledgement")
+        f.acknowledgements.removeLast()()
+        f.drain()
+        expect(f.verifiedVisualValues.isEmpty, "wait for every display's acknowledgement before checking for interactions")
+        f.elapsed += 2
+        f.acknowledgements.removeLast()()
+        expect(f.verifiedVisualValues.isEmpty, "read after a settling interval even when all writes were acknowledged")
+        f.drain()
+        expect(f.result == [] && f.verifiedVisualValues.count == 2, "each normally settled display gets one read")
+        expect(f.verifiedVisualValues.allSatisfy { abs($0.time - 2.35) < 0.0001 }, "the settling interval begins at the last acknowledgement")
+        expect(f.visualValues.count == 2 && f.visualValues.allSatisfy { $0.fields == [.brightness, .contrast] }, "send both fields in each initial write")
+    }
+
+    private static func delayedBrightnessNeedsNoCorrection() {
+        let f = Fixture()
+        f.readSequence[1] = [VisualValues(brightness: 0.1, contrast: 0)]
+        f.start(); f.drain()
+        expect(f.result == [] && f.visualCallCount(for: 1) == 1 && f.visualCallCount(for: 2) == 1,
+               "an early mismatch can converge without rewriting either display")
+        let times = f.verifiedVisualValues.filter { $0.displayID == 1 }.map(\.time)
+        expect(times.count == 2 && abs(times[1] - times[0] - 0.35) < 0.0001, "repeat the read after another settling interval")
+    }
+
+    private static func repairOnlyPersistentFields() {
+        let f = Fixture()
+        let contrastOff = VisualValues(brightness: 0.5, contrast: -0.2)
+        f.readSequence[1] = [VisualValues(brightness: 0.1, contrast: -0.2), contrastOff, contrastOff]
+        f.start(); f.drain()
+        expect(f.result == [], "a slow final read after the correction may converge")
+        let writes = f.visualValues.filter { $0.displayID == 1 }
+        expect(writes.map(\.fields) == [[.brightness, .contrast], [.contrast]],
+               "only contrast remained wrong across both reads, so never rewrite brightness")
+        expect(f.visualCallCount(for: 2) == 1 && f.verifiedVisualValues.filter { $0.displayID == 2 }.count >= 2,
+               "after correcting one screen, recheck a previously matching neighbour without rewriting it")
+    }
+
+    private static func finalReadDetectsCrossDisplayChanges() {
+        let f = Fixture()
+        let wrong = VisualValues(brightness: 0.25, contrast: 0)
+        f.readSequence[1] = [wrong, wrong]
+        // Only a second write to display A disturbs B, regardless of how many times B was read earlier.
+        f.beforeVisual = {
+            if f.visualCallCount(for: 1) == 2 { f.deviceValues[2] = wrong }
+        }
+        f.start(); f.drain()
+        expect(f.visualValues.filter { $0.displayID == 1 }.map(\.fields) == [[.brightness, .contrast], [.brightness]],
+               "correct only the faulty brightness field")
+        expect(f.visualCallCount(for: 2) == 1 && f.result?.contains { $0.hasPrefix("b：") } == true,
+               "expose sync-induced drift on the neighbour without ping-pong writes")
+        expect(f.result?.contains { $0.contains("部分完成") && $0.contains("a的") } == true,
+               "only the display still matching after the last write counts as verified")
+    }
+
+    private static func persistentErrorAndIdentityChangeNeverLoop() {
+        let wrong = VisualValues(brightness: 0.1, contrast: 0)
+        let f = Fixture()
+        f.readSequence[1] = Array(repeating: wrong, count: 12)
+        f.start(); f.drain()
+        expect(f.result?.contains { $0.hasPrefix("a：") } == true && f.visualCallCount(for: 1) == 2,
+               "an unresponsive screen gets at most one corrective write")
+        expect(f.visualCallCount(for: 2) == 1 && !f.application.isRunning, "stop retrying and release the application lock")
+
+        let changed = Fixture()
+        changed.readSequence[1] = [wrong, wrong]
+        changed.afterVerify = {
+            if changed.verifiedVisualValues.last?.displayID == 1 { changed.displays[0] = screen("a", 9) }
+        }
+        changed.start(); changed.drain()
+        expect(changed.result?.contains { $0.hasPrefix("a：") } == true, "an ID change between verification passes invalidates the screen")
+        expect(changed.visualCallCount(for: 1) == 1 && changed.visualCallCount(for: 9) == 0,
+               "never issue a correction to the old or replacement ID")
+    }
+
+    private static func duplicateIdentityRejectedBeforeAnyWrite() {
+        let f = Fixture()
+        f.preset.displays.append(entry("a", enabled: false))
+        f.start(); f.drain()
+        expect(f.result?.isEmpty == false && !f.application.isRunning, "conflicting entries with the same identity reject the preset")
+        expect(f.events.isEmpty && f.visualValues.isEmpty && f.verifiedVisualValues.isEmpty,
+               "a malformed preset cannot reconfigure a display or send visual commands")
+    }
+
+    private static func rotatingMismatchDoesNotJustifyAWrite() {
+        let f = Fixture()
+        f.readSequence[1] = [
+            VisualValues(brightness: 0.1, contrast: 0),
+            VisualValues(brightness: 0.5, contrast: -0.2)
+        ]
+        f.start(); f.drain()
+        expect(f.visualCallCount(for: 1) == 1 && f.visualCallCount(for: 2) == 1,
+               "two unrelated single-read mismatches do not establish a persistent field to rewrite")
+        expect(f.result?.contains { $0.hasPrefix("a：") } == true || f.verifiedVisualValues.filter { $0.displayID == 1 }.count > 2,
+               "the second read differed from the target, so only a fresh successful read can clear the error")
     }
 
     private static func connectionLossAfterDisconnectRestoresScreen() {

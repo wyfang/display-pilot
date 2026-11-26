@@ -42,6 +42,24 @@ private final class SystemBetterDisplayTransport: BetterDisplayNotificationTrans
     }
 }
 
+enum VisualField: Hashable { case brightness, contrast }
+
+struct VisualValues: Equatable {
+    let brightness: Double
+    let contrast: Double
+
+    func mismatches(comparedTo target: VisualValues) -> Set<VisualField> {
+        var fields: Set<VisualField> = []
+        // Display brightness often has integer-percent steps, but blackout is an exact state.
+        let brightnessMatches = (brightness == 0) == (target.brightness == 0)
+            && abs(brightness - target.brightness) <= 0.010_001
+        let contrastMatches = abs(contrast - target.contrast) <= 0.001_001
+        if !brightnessMatches { fields.insert(.brightness) }
+        if !contrastMatches { fields.insert(.contrast) }
+        return fields
+    }
+}
+
 final class BetterDisplayBridge {
     private struct Request: Encodable {
         let uuid: String
@@ -79,73 +97,38 @@ final class BetterDisplayBridge {
     }
 
     func setVisualSettings(
-        brightness: Double,
-        contrast: Double,
-        displayID: CGDirectDisplayID,
+        _ target: VisualValues, fields: Set<VisualField>, displayID: CGDirectDisplayID,
         completion: @escaping (Result<Void, AppFailure>) -> Void
     ) {
         onMain {
-            guard self.validate(brightness: brightness, contrast: contrast, completion: completion) else { return }
-            self.request(commands: ["set"], parameters: [
-                "displayID": String(displayID),
-                "brightness": Self.format(brightness),
-                "contrast": Self.format(contrast)
-            ]) { result in
-                switch result {
-                case .failure(let failure): completion(.failure(failure))
-                case .success:
-                    // A successful response acknowledges the command. Read the
-                    // resulting settings before reporting application success.
-                    self.verifyVisualSettings(brightness: brightness, contrast: contrast, displayID: displayID, completion: completion)
-                }
+            guard !fields.isEmpty else { completion(.success(())); return }
+            guard (0...1).contains(target.brightness), (-0.9...0.9).contains(target.contrast) else {
+                completion(.failure(AppFailure(message: "预设中的亮度或对比度数值无效，请重新编辑预设。")))
+                return
+            }
+            var parameters: [String: String?] = ["displayID": String(displayID)]
+            if fields.contains(.brightness) {
+                let rounded = Self.format(target.brightness)
+                // Preserve legacy fractional settings that would otherwise request a blackout.
+                parameters["brightness"] = target.brightness > 0 && rounded == "0.000" ? String(target.brightness) : rounded
+            }
+            if fields.contains(.contrast) { parameters["contrast"] = Self.format(target.contrast) }
+            self.request(commands: ["set"], parameters: parameters) { result in
+                completion(result.map { _ in () })
             }
         }
     }
 
-    func verifyVisualSettings(
-        brightness: Double,
-        contrast: Double,
-        displayID: CGDirectDisplayID,
-        completion: @escaping (Result<Void, AppFailure>) -> Void
+    func readVisualSettings(
+        displayID: CGDirectDisplayID, completion: @escaping (Result<VisualValues, AppFailure>) -> Void
     ) {
         onMain {
-            guard self.validate(brightness: brightness, contrast: contrast, completion: completion) else { return }
-            self.verify(brightness: brightness, contrast: contrast, displayID: displayID, attempt: 0, completion: completion)
-        }
-    }
-
-    private func verify(
-        brightness: Double, contrast: Double, displayID: CGDirectDisplayID, attempt: Int,
-        completion: @escaping (Result<Void, AppFailure>) -> Void
-    ) {
-        readValue("brightness", displayID: displayID) { brightnessResult in
-            switch brightnessResult {
-            case .failure(let failure): completion(.failure(failure))
-            case .success(let actualBrightness):
-                self.readValue("contrast", displayID: displayID) { contrastResult in
-                    switch contrastResult {
-                    case .failure(let failure): completion(.failure(failure))
-                    case .success(let actualContrast):
-                        // Hardware brightness commonly has integer-percent steps;
-                        // software contrast is reported as a fractional value.
-                        let brightnessMatches = abs(actualBrightness - brightness) <= 0.010_001
-                        let contrastMatches = abs(actualContrast - contrast) <= 0.001_001
-                        if brightnessMatches && contrastMatches {
-                            completion(.success(()))
-                        } else if attempt < 2 {
-                            _ = self.transport.schedule(after: 0.35) {
-                                self.verify(brightness: brightness, contrast: contrast, displayID: displayID, attempt: attempt + 1, completion: completion)
-                            }
-                        } else {
-                            var differences: [String] = []
-                            if !brightnessMatches {
-                                differences.append("亮度目标 \(Self.percent(brightness))，实际 \(Self.percent(actualBrightness))")
-                            }
-                            if !contrastMatches {
-                                differences.append("对比度目标 \(Self.percent(contrast))，实际 \(Self.percent(actualContrast))")
-                            }
-                            completion(.failure(AppFailure(message: "BetterDisplay 读回结果不一致：" + differences.joined(separator: "；"))))
-                        }
+            self.readValue("brightness", displayID: displayID) { result in
+                switch result {
+                case .failure(let failure): completion(.failure(failure))
+                case .success(let brightness):
+                    self.readValue("contrast", displayID: displayID) { contrast in
+                        completion(contrast.map { VisualValues(brightness: brightness, contrast: $0) })
                     }
                 }
             }
@@ -189,7 +172,7 @@ final class BetterDisplayBridge {
         }
         pending[uuid] = PendingRequest(completion: completion)
         let cancel = transport.schedule(after: timeout) { [weak self] in
-            self?.finish(uuid, result: .failure(AppFailure(message: "BetterDisplay 响应超时，请确认应用仍在运行，并在其设置中启用 CLI 和通知集成。")))
+            self?.finish(uuid, result: .failure(AppFailure(message: "BetterDisplay 响应超时，请确认应用仍在运行，并在其设置中启用 CLI 和通知集成。", reason: .unconfirmed)))
         }
         pending[uuid]?.cancelTimeout = cancel
         transport.postRequest(json, prefix: prefix)
@@ -200,7 +183,7 @@ final class BetterDisplayBridge {
         guard let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let uuid = envelope["uuid"] as? String, pending[uuid] != nil else { return }
         guard let response = try? JSONDecoder().decode(Response.self, from: data), let succeeded = response.result else {
-            finish(uuid, result: .failure(AppFailure(message: "BetterDisplay 返回了无法确认成功状态的响应。")))
+            finish(uuid, result: .failure(AppFailure(message: "BetterDisplay 返回了无法确认成功状态的响应。", reason: .unconfirmed)))
             return
         }
         if succeeded {
@@ -219,20 +202,8 @@ final class BetterDisplayBridge {
         request.completion(result)
     }
 
-    private func validate(brightness: Double, contrast: Double, completion: (Result<Void, AppFailure>) -> Void) -> Bool {
-        guard brightness.isFinite, contrast.isFinite, (0...1).contains(brightness), (-0.9...0.9).contains(contrast) else {
-            completion(.failure(AppFailure(message: "预设中的亮度或对比度数值无效，请重新编辑预设。")))
-            return false
-        }
-        return true
-    }
-
     private static func format(_ value: Double) -> String {
         String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), value)
-    }
-
-    private static func percent(_ value: Double) -> String {
-        String(format: "%.1f%%", locale: Locale(identifier: "en_US_POSIX"), value * 100)
     }
 
     private func onMain(_ action: @escaping () -> Void) {

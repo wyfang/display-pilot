@@ -176,7 +176,7 @@ struct PresetCollection: Codable, Equatable {
 }
 
 struct AppFailure: Error {
-    enum Reason { case general, requiresPro, unavailable }
+    enum Reason { case general, requiresPro, unavailable, unconfirmed }
     let message: String
     var reason: Reason = .general
 }
@@ -188,6 +188,87 @@ protocol PreferenceStorage: AnyObject {
 }
 
 extension UserDefaults: PreferenceStorage {}
+
+/// Driven on the main thread, including while the status menu is tracking.
+final class PresetStartDelay {
+    typealias Schedule = (TimeInterval, @escaping () -> Void) -> () -> Void
+
+    private final class Countdown {
+        let deadline: TimeInterval
+        let action: () -> Void
+
+        init(deadline: TimeInterval, action: @escaping () -> Void) {
+            self.deadline = deadline
+            self.action = action
+        }
+    }
+
+    private let defaults: PreferenceStorage
+    private let now: () -> TimeInterval
+    private let schedule: Schedule
+    private let preferenceKey = "presetStartDelaySeconds"
+    private var pending: Countdown?
+    private var cancelTick: (() -> Void)?
+    private(set) var remainingSeconds = 0
+    var onChange: (() -> Void)?
+    var isPending: Bool { pending != nil }
+
+    init(defaults: PreferenceStorage = UserDefaults.standard,
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         schedule: @escaping Schedule = { delay, action in
+             let timer = Timer(fire: Date(timeIntervalSinceNow: delay), interval: 0, repeats: false) { _ in action() }
+             RunLoop.main.add(timer, forMode: .common)
+             return { timer.invalidate() }
+         }) {
+        self.defaults = defaults
+        self.now = now
+        self.schedule = schedule
+    }
+
+    var seconds: Int {
+        get { min(60, max(0, defaults.object(forKey: preferenceKey) as? Int ?? 0)) }
+        set { defaults.set(min(60, max(0, newValue)), forKey: preferenceKey) }
+    }
+
+    @discardableResult
+    func start(_ action: @escaping () -> Void) -> Bool {
+        guard pending == nil else { return false }
+        let delay = seconds
+        guard delay > 0 else { action(); return true }
+        let countdown = Countdown(deadline: now() + Double(delay), action: action)
+        pending = countdown
+        tick(countdown)
+        return true
+    }
+
+    func cancel() {
+        guard isPending else { return }
+        cancelTick?()
+        cancelTick = nil
+        pending = nil
+        remainingSeconds = 0
+        onChange?()
+    }
+
+    private func tick(_ countdown: Countdown) {
+        guard pending === countdown else { return }
+        let left = countdown.deadline - now()
+        guard left > 0 else {
+            cancel()
+            countdown.action()
+            return
+        }
+        let count = Int(ceil(left))
+        let untilNextSecond = left - Double(count - 1)
+        cancelTick = schedule(untilNextSecond) { [weak self] in self?.tick(countdown) }
+        if count != remainingSeconds {
+            remainingSeconds = count
+            onChange?()
+        }
+    }
+
+    deinit { cancelTick?() }
+}
 
 protocol DisplayBackend {
     func snapshots(includeModes: Bool) -> [DisplayInfo]

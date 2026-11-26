@@ -4,14 +4,15 @@ import CoreGraphics
 /// Serializes a complete preset and validates the final state after every side effect.
 /// Dependencies keep retries testable without changing physical displays or preferences.
 final class PresetApplication {
-    typealias VisualOperation = (Double, Double, CGDirectDisplayID, @escaping (Result<Void, AppFailure>) -> Void) -> Void
+    typealias VisualWrite = (VisualValues, Set<VisualField>, CGDirectDisplayID, @escaping (Result<Void, AppFailure>) -> Void) -> Void
+    typealias VisualRead = (CGDirectDisplayID, @escaping (Result<VisualValues, AppFailure>) -> Void) -> Void
     typealias RotationOperation = (Int, String, @escaping (Result<Void, AppFailure>) -> Void) -> Void
     struct Dependencies {
         var displays: (Bool) -> [DisplayInfo]
         var setEnabled: (Bool, String) -> Result<Void, AppFailure>
         var setModes: ([(mode: DisplayModeInfo, identity: String)]) -> [String: AppFailure]
-        var setVisual: VisualOperation
-        var verifyVisual: VisualOperation
+        var setVisual: VisualWrite
+        var readVisual: VisualRead
         var schedule: (TimeInterval, @escaping () -> Void) -> Void
         var setRotation: RotationOperation = { _, _, completion in
             completion(.failure(AppFailure(message: "当前环境不支持旋转显示器。")))
@@ -20,6 +21,7 @@ final class PresetApplication {
 
     private final class Context {
         let preset: DisplayPreset
+        let verifyVisualSettings: Bool
         let completion: ([String]) -> Void
         var enableFailures: [String: String] = [:]
         var modeFailures: [String: String] = [:]
@@ -31,10 +33,11 @@ final class PresetApplication {
         var afterDisconnect = false
         var stoppedBeforeVisual = false
         var disableFailures: [String: String] = [:]
-        var visualFailures: [String: String] = [:]
-        var verifiedIDs: [String: CGDirectDisplayID] = [:]
-        init(_ preset: DisplayPreset, completion: @escaping ([String]) -> Void) {
+        var visualFailures: [String: AppFailure] = [:]
+        var completedVisualIDs: [String: CGDirectDisplayID] = [:]
+        init(_ preset: DisplayPreset, verifyVisualSettings: Bool, completion: @escaping ([String]) -> Void) {
             self.preset = preset
+            self.verifyVisualSettings = verifyVisualSettings
             self.completion = completion
         }
     }
@@ -44,14 +47,18 @@ final class PresetApplication {
     init(dependencies: Dependencies) { self.dependencies = dependencies }
 
     @discardableResult
-    func apply(_ preset: DisplayPreset, completion: @escaping ([String]) -> Void) -> Bool {
+    func apply(_ preset: DisplayPreset, verifyVisualSettings: Bool = true, completion: @escaping ([String]) -> Void) -> Bool {
         guard !isRunning else { return false }
         guard preset.displays.contains(where: \.enabled) else {
             completion(["预设没有设置要开启的显示器，请先编辑预设。"])
             return false
         }
+        guard Set(preset.displays.map(\.identity)).count == preset.displays.count else {
+            completion(["预设包含重复的显示器，请先编辑预设。"])
+            return false
+        }
         isRunning = true
-        let context = Context(preset, completion: completion)
+        let context = Context(preset, verifyVisualSettings: verifyVisualSettings, completion: completion)
         connectTargets(context)
         waitForTargets(context, attempt: 0, signature: nil, stableCount: 0)
         return true
@@ -184,7 +191,7 @@ final class PresetApplication {
             }
             if (!connected || retryableGeometry) && attempt < 6 { self.applyModes(context, attempt: attempt + 1) }
             else if !connected { self.stopBeforeVisual(context) }
-            else if context.afterDisconnect { self.applyVisual(context, pass: 1) }
+            else if context.afterDisconnect { self.applyVisual(context) }
             else { self.disableUnwanted(context, attempt: 1) }
         }
         let alreadyMatched = context.preset.displays.filter(\.enabled).allSatisfy { entry in
@@ -197,19 +204,47 @@ final class PresetApplication {
         }
     }
 
-    private func applyVisual(_ context: Context, pass: Int) {
+    private struct VisualTarget {
+        let identity: String
+        let id: CGDirectDisplayID
+        let desired: VisualValues
+    }
+
+    private typealias VisualChange = (target: VisualTarget, fields: Set<VisualField>)
+
+    private struct VisualMismatch {
+        let target: VisualTarget
+        let actual: VisualValues
+        let fields: Set<VisualField>
+
+        var failure: AppFailure {
+            func percent(_ value: Double) -> String {
+                if value > 0 && value < 0.00001 { return "<0.001%" }
+                return (value * 100).formatted(.number.precision(.fractionLength(0...3))) + "%"
+            }
+            var details: [String] = []
+            if fields.contains(.brightness) {
+                details.append("亮度目标 \(percent(target.desired.brightness))，实际 \(percent(actual.brightness))")
+            }
+            if fields.contains(.contrast) {
+                details.append("对比度目标 \(percent(target.desired.contrast))，实际 \(percent(actual.contrast))")
+            }
+            return AppFailure(message: "BetterDisplay 读回结果不一致：" + details.joined(separator: "；"))
+        }
+    }
+
+    private func applyVisual(_ context: Context) {
         let current = dependencies.displays(false)
         guard targetsConnected(context, displays: current) else { stopBeforeVisual(context); return }
-        performVisual(context, verify: false) { [weak self] in
-            guard let self else { return }
-            if pass == 1 && !context.visualFailures.isEmpty {
-                self.dependencies.schedule(0.8) { [weak self] in self?.applyVisual(context, pass: 2) }
-            } else {
-                self.dependencies.schedule(0.35) { [weak self] in
-                    guard let self else { return }
-                    self.performVisual(context, verify: true) { [weak self] in self?.finish(context) }
-                }
-            }
+        let targets = context.preset.displays.compactMap { entry -> VisualTarget? in
+            guard entry.enabled, let display = current.first(where: { $0.identity == entry.identity && $0.active && $0.canControl }) else { return nil }
+            return VisualTarget(identity: entry.identity, id: display.id,
+                                desired: VisualValues(brightness: entry.brightness, contrast: entry.contrast))
+        }
+        let changes: [VisualChange] = targets.map { ($0, [.brightness, .contrast]) }
+        writeVisual(context, changes: changes) {
+            if context.verifyVisualSettings { self.verifyVisual(context, targets: targets, allowCorrection: true) }
+            else { self.finish(context) }
         }
     }
 
@@ -219,25 +254,94 @@ final class PresetApplication {
         }
     }
 
-    private func performVisual(_ context: Context, verify: Bool, completion: @escaping () -> Void) {
-        let displays = dependencies.displays(false)
-        let targets = context.preset.displays.compactMap { entry -> (DisplayPresetEntry, DisplayInfo)? in
-            guard entry.enabled, let display = displays.first(where: { $0.identity == entry.identity && $0.active && $0.canControl }) else { return nil }
-            return (entry, display)
-        }
-        guard !targets.isEmpty else { completion(); return }
-        var remaining = targets.count
-        let operation = verify ? dependencies.verifyVisual : dependencies.setVisual
-        for (entry, display) in targets {
-            operation(entry.brightness, entry.contrast, display.id) { result in
-                switch result {
-                case .success:
-                    context.visualFailures.removeValue(forKey: entry.identity)
-                    if verify { context.verifiedIDs[entry.identity] = display.id }
-                case .failure(let error): context.visualFailures[entry.identity] = error.message
-                }
+    // Every operation and callback runs on the main thread. Wait for all screens
+    // in a batch before reading: a linked display may be changed by its peer.
+    private func runVisualBatch<Item>(_ items: [Item], operation: (Item, @escaping () -> Void) -> Void,
+                                      completion: @escaping () -> Void) {
+        guard !items.isEmpty else { completion(); return }
+        var remaining = items.count
+        for item in items {
+            operation(item) {
                 remaining -= 1
                 if remaining == 0 { completion() }
+            }
+        }
+    }
+
+    private func visualAddressIsCurrent(_ target: VisualTarget, context: Context) -> Bool {
+        guard dependencies.displays(false).contains(where: {
+            $0.identity == target.identity && $0.id == target.id && $0.active && $0.canControl
+        }) else {
+            context.visualFailures[target.identity] = AppFailure(message: "显示器编号或连接已变化，请重新应用预设。")
+            return false
+        }
+        return true
+    }
+
+    private func writeVisual(_ context: Context, changes: [VisualChange], completion: @escaping () -> Void) {
+        runVisualBatch(changes, operation: { change, done in
+            let target = change.target
+            guard self.visualAddressIsCurrent(target, context: context) else { done(); return }
+            self.dependencies.setVisual(target.desired, change.fields, target.id) { result in
+                switch result {
+                case .success:
+                    context.visualFailures[target.identity] = nil
+                    if !context.verifyVisualSettings { context.completedVisualIDs[target.identity] = target.id }
+                case .failure(let error): context.visualFailures[target.identity] = error
+                }
+                done()
+            }
+        }, completion: completion)
+    }
+
+    private func readAfterSettling(_ context: Context, targets: [VisualTarget],
+                                   completion: @escaping ([VisualMismatch]) -> Void) {
+        let readable = targets.filter {
+            guard let failure = context.visualFailures[$0.identity] else { return true }
+            return failure.reason == .unconfirmed // The write may have succeeded despite a lost ACK.
+        }
+        guard !readable.isEmpty else { completion([]); return }
+        dependencies.schedule(0.35) {
+            var mismatches: [VisualMismatch] = []
+            self.runVisualBatch(readable, operation: { target, done in
+                guard self.visualAddressIsCurrent(target, context: context) else { done(); return }
+                self.dependencies.readVisual(target.id) { result in
+                    switch result {
+                    case .success(let actual):
+                        context.visualFailures[target.identity] = nil
+                        let fields = actual.mismatches(comparedTo: target.desired)
+                        if fields.isEmpty { context.completedVisualIDs[target.identity] = target.id }
+                        else {
+                            context.completedVisualIDs[target.identity] = nil
+                            mismatches.append(VisualMismatch(target: target, actual: actual, fields: fields))
+                        }
+                    case .failure(let error):
+                        let detail = context.visualFailures[target.identity].map { $0.message + "\n读回失败：" } ?? ""
+                        context.visualFailures[target.identity] = AppFailure(message: detail + error.message)
+                    }
+                    done()
+                }
+            }, completion: { completion(mismatches) })
+        }
+    }
+
+    private func verifyVisual(_ context: Context, targets: [VisualTarget], allowCorrection: Bool) {
+        readAfterSettling(context, targets: targets) { first in
+            guard !first.isEmpty else { self.finish(context); return }
+            let firstFields = Dictionary(uniqueKeysWithValues: first.map { ($0.target.identity, $0.fields) })
+            self.readAfterSettling(context, targets: first.map(\.target)) { second in
+                let corrections: [VisualChange] = second.compactMap { mismatch in
+                    let persistent = mismatch.fields.intersection(firstFields[mismatch.target.identity] ?? [])
+                    return persistent.isEmpty ? nil : (mismatch.target, persistent)
+                }
+                if allowCorrection && !corrections.isEmpty {
+                    self.writeVisual(context, changes: corrections) {
+                        self.verifyVisual(context, targets: targets, allowCorrection: false)
+                    }
+                } else {
+                    for mismatch in second { context.visualFailures[mismatch.target.identity] = mismatch.failure }
+                    self.finish(context)
+                }
             }
         }
     }
@@ -281,7 +385,7 @@ final class PresetApplication {
             let displays = self.dependencies.displays(false)
             let remaining = unwanted.contains { entry in displays.contains { $0.identity == entry.identity && $0.active } }
             if remaining && attempt < 3 { self.disableUnwanted(context, attempt: attempt + 1) }
-            else if context.disconnected.isEmpty { self.applyVisual(context, pass: 1) }
+            else if context.disconnected.isEmpty { self.applyVisual(context) }
             else {
                 context.afterDisconnect = true
                 self.waitForTargets(context, attempt: 0, signature: nil, stableCount: 0)
@@ -350,9 +454,10 @@ final class PresetApplication {
                 if let mode = entry.requestedMode, display.currentMode?.describesSameMode(as: mode) != true {
                     errors.append("\(entry.name)：\(context.modeFailures[entry.identity] ?? "未切换到保存的分辨率 \(mode.label)")")
                 }
-                if let reason = context.visualFailures[entry.identity] { errors.append("\(entry.name)：\(reason)") }
-                else if !context.stoppedBeforeVisual && context.verifiedIDs[entry.identity] != display.id {
-                    errors.append("\(entry.name)：尚未确认最终亮度和对比度，请重新应用预设")
+                if let failure = context.visualFailures[entry.identity] { errors.append("\(entry.name)：\(failure.message)") }
+                else if !context.stoppedBeforeVisual && context.completedVisualIDs[entry.identity] != display.id {
+                    let detail = context.verifyVisualSettings ? "尚未确认最终亮度和对比度" : "显示器编号已变化，无法确认亮度和对比度指令已送达当前显示器"
+                    errors.append("\(entry.name)：\(detail)，请重新应用预设")
                 }
             } else if display != nil || (context.stoppedBeforeVisual && context.disconnected.contains(entry.identity)) {
                 errors.append("\(entry.name)：\(context.disableFailures[entry.identity] ?? "显示器没有按预设断开")")
@@ -364,11 +469,12 @@ final class PresetApplication {
             let confirmed = context.preset.displays.compactMap { entry -> String? in
                 guard entry.enabled, context.visualFailures[entry.identity] == nil,
                       let display = displays.first(where: { $0.identity == entry.identity && $0.active && $0.canControl }),
-                      context.verifiedIDs[entry.identity] == display.id else { return nil }
+                      context.completedVisualIDs[entry.identity] == display.id else { return nil }
                 return entry.name
             }
             if !confirmed.isEmpty {
-                errors.append("部分完成：\(confirmed.joined(separator: "、"))的亮度和对比度已应用并确认；其余未完成设置见上方。")
+                let detail = context.verifyVisualSettings ? "亮度和对比度已应用并确认" : "亮度和对比度指令已发送"
+                errors.append("部分完成：\(confirmed.joined(separator: "、"))的\(detail)；其余未完成设置见上方。")
             }
         }
         isRunning = false

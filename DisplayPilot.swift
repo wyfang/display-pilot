@@ -444,7 +444,6 @@ final class PresetWindowController: NSWindowController, NSTextFieldDelegate {
             return
         }
         store.save(draft)
-        UserDefaults.standard.removeObject(forKey: "lastAppliedPreset")
         window?.close()
         onSave?()
     }
@@ -462,17 +461,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var statusItem: NSStatusItem!
     private var presetWindow: PresetWindowController!
     private var applyingPreset = false
+    private let startDelay = PresetStartDelay()
+    private var pendingPresetName: String?
+    private weak var cancelCountdownItem: NSMenuItem?
+    private var lastPreset: (slot: String, verified: Bool)?
+    private var presetBusy: Bool { applyingPreset || startDelay.isPending }
+    private var verifyVisualSettings: Bool {
+        get { UserDefaults.standard.bool(forKey: "verifyPresetVisualSettings") }
+        set { UserDefaults.standard.set(newValue, forKey: "verifyPresetVisualSettings") }
+    }
     private var displayChangeObserver: NSObjectProtocol?
     private var refreshWork: DispatchWorkItem?
     private lazy var presetApplication = PresetApplication(dependencies: .init(
         displays: { [unowned self] includeModes in self.displayController.displays(includeModes: includeModes) },
         setEnabled: { [unowned self] enabled, identity in self.displayController.setEnabled(enabled, identity: identity) },
         setModes: { [unowned self] requests in self.displayController.setModes(requests) },
-        setVisual: { [unowned self] brightness, contrast, id, completion in
-            self.betterDisplay.setVisualSettings(brightness: brightness, contrast: contrast, displayID: id, completion: completion)
+        setVisual: { [unowned self] target, fields, id, completion in
+            self.betterDisplay.setVisualSettings(target, fields: fields, displayID: id, completion: completion)
         },
-        verifyVisual: { [unowned self] brightness, contrast, id, completion in
-            self.betterDisplay.verifyVisualSettings(brightness: brightness, contrast: contrast, displayID: id, completion: completion)
+        readVisual: { [unowned self] id, completion in
+            self.betterDisplay.readVisualSettings(displayID: id, completion: completion)
         },
         schedule: { delay, action in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action) },
         setRotation: { [unowned self] rotation, identity, completion in
@@ -481,14 +489,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     ))
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        UserDefaults.standard.register(defaults: ["presetA": 0.35, "presetB": 0.80])
+        UserDefaults.standard.register(defaults: ["presetA": 0.35, "presetB": 0.80, "verifyPresetVisualSettings": true])
         presetWindow = PresetWindowController(store: presetStore) { [weak self] in
             self?.displayController.displays() ?? []
         }
-        presetWindow.onSave = { [weak self] in self?.rebuildMenu() }
-        presetWindow.canSave = { [weak self] in self?.applyingPreset == false }
-        // Persisted checks cannot prove the current BetterDisplay state after a restart.
-        UserDefaults.standard.removeObject(forKey: "lastAppliedPreset")
+        presetWindow.onSave = { [weak self] in
+            self?.lastPreset = nil
+            self?.rebuildMenu()
+        }
+        presetWindow.canSave = { [weak self] in self?.presetBusy == false }
+        startDelay.onChange = { [weak self] in self?.updateCountdownIndicator() }
         displayChangeObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -507,7 +517,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     func menuNeedsUpdate(_ menu: NSMenu) { rebuildMenu(menu) }
 
     private func rebuildMenu(_ existingMenu: NSMenu? = nil) {
-        let menu = existingMenu ?? NSMenu()
+        let menu = existingMenu ?? statusItem.menu ?? NSMenu()
         menu.removeAllItems()
         menu.autoenablesItems = false
         menu.delegate = self
@@ -527,37 +537,50 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 item.target = self
                 item.representedObject = display.identity
                 item.state = display.active ? .on : .off
-                item.isEnabled = !applyingPreset && display.canControl
+                item.isEnabled = !presetBusy && display.canControl
                 menu.addItem(item)
             }
         }
 
         menu.addItem(.separator())
         let presets = presetStore.load(displays: displays)
-        var lastApplied = UserDefaults.standard.string(forKey: "lastAppliedPreset")
-        if let slot = lastApplied {
-            let preset = slot == "B" ? presets.presetB : presets.presetA
+        if let lastPreset {
+            let preset = lastPreset.slot == "B" ? presets.presetB : presets.presetA
             if !PresetApplication.configurationErrors(for: preset, displays: displays).isEmpty {
-                UserDefaults.standard.removeObject(forKey: "lastAppliedPreset")
-                lastApplied = nil
+                self.lastPreset = nil
             }
         }
-        let a = actionItem(presetMenuTitle(presets.presetA), #selector(applyPresetA), key: "1")
-        let b = actionItem(presetMenuTitle(presets.presetB), #selector(applyPresetB), key: "2")
-        a.state = lastApplied == "A" ? .on : .off
-        b.state = lastApplied == "B" ? .on : .off
-        a.isEnabled = !applyingPreset
-        b.isEnabled = !applyingPreset
+        let a = actionItem(presets.presetA.name, #selector(applyPresetA), key: "1")
+        let b = actionItem(presets.presetB.name, #selector(applyPresetB), key: "2")
+        if let lastPreset {
+            let item = lastPreset.slot == "A" ? a : b
+            if lastPreset.verified {
+                item.state = .on
+                item.title += "（上次已核验）"
+            } else {
+                item.title += "（已发送）"
+            }
+        }
+        a.isEnabled = !presetBusy
+        b.isEnabled = !presetBusy
         menu.addItem(a)
         menu.addItem(b)
-        if applyingPreset {
+        if startDelay.isPending {
+            let cancel = actionItem("", #selector(cancelCountdown))
+            menu.addItem(cancel)
+            cancelCountdownItem = cancel
+            updateCountdownIndicator()
+        } else if applyingPreset {
             let progress = NSMenuItem(title: "正在应用预设…", action: nil, keyEquivalent: "")
             progress.isEnabled = false
             menu.addItem(progress)
         }
         let edit = actionItem("编辑预设…", #selector(openPresetSettings))
-        edit.isEnabled = !applyingPreset
+        edit.isEnabled = !presetBusy
         menu.addItem(edit)
+        let options = actionItem("预设切换设置…", #selector(openSwitchOptions))
+        options.isEnabled = !presetBusy
+        menu.addItem(options)
 
         menu.addItem(.separator())
         menu.addItem(actionItem("刷新显示器", #selector(refresh), key: "r"))
@@ -565,11 +588,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(launchAtLoginMenuItem())
         menu.addItem(.separator())
         menu.addItem(actionItem("退出 Display Pilot", #selector(quit), key: "q"))
-        if existingMenu == nil { statusItem.menu = menu }
-    }
-
-    private func presetMenuTitle(_ preset: DisplayPreset) -> String {
-        preset.name
+        if statusItem.menu !== menu { statusItem.menu = menu }
     }
 
     private func actionItem(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
@@ -579,12 +598,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func toggleDisplay(_ sender: NSMenuItem) {
-        guard !applyingPreset,
+        guard !presetBusy,
               let identity = sender.representedObject as? String,
               let display = displayController.displays(includeModes: false).first(where: { $0.identity == identity }) else { return }
         switch displayController.setEnabled(!display.active, identity: identity) {
         case .success:
-            UserDefaults.standard.removeObject(forKey: "lastAppliedPreset")
+            lastPreset = nil
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.rebuildMenu() }
         case .failure(let error): showError(error.message)
         }
@@ -594,7 +613,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func applyPresetB() { applyPreset(slot: "B") }
 
     private func applyPreset(slot: String) {
-        guard !applyingPreset else { return }
+        guard !presetBusy else { return }
         let displays = displayController.displays(includeModes: false)
         let collection = presetStore.load(displays: displays)
         let preset = slot == "B" ? collection.presetB : collection.presetA
@@ -602,11 +621,41 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             showError("\(preset.name) 没有设置要开启的显示器，请先编辑预设。")
             return
         }
-        applyingPreset = true
         presetWindow.setSavingEnabled(false)
-        UserDefaults.standard.removeObject(forKey: "lastAppliedPreset")
+        pendingPresetName = preset.name
+        startDelay.start { [weak self] in self?.performPreset(preset, slot: slot) }
+        if startDelay.isPending { rebuildMenu() }
+    }
+
+    private func updateCountdownIndicator() {
+        let seconds = startDelay.remainingSeconds
+        let button = statusItem.button
+        statusItem.length = seconds > 0 ? NSStatusItem.variableLength : NSStatusItem.squareLength
+        button?.imagePosition = seconds > 0 ? .imageLeading : .imageOnly
+        button?.title = seconds > 0 ? "\(seconds)s" : ""
+        if seconds > 0, let name = pendingPresetName {
+            button?.toolTip = "\(seconds) 秒后应用「\(name)」"
+            cancelCountdownItem?.title = "取消切换「\(name)」（剩余 \(seconds) 秒）"
+        } else {
+            button?.toolTip = nil
+        }
+    }
+
+    @objc private func cancelCountdown() {
+        guard startDelay.isPending else { return }
+        startDelay.cancel()
+        pendingPresetName = nil
+        presetWindow.setSavingEnabled(true)
         rebuildMenu()
-        presetApplication.apply(preset) { [weak self] errors in
+    }
+
+    private func performPreset(_ preset: DisplayPreset, slot: String) {
+        pendingPresetName = nil
+        applyingPreset = true
+        lastPreset = nil
+        let verify = verifyVisualSettings
+        rebuildMenu()
+        presetApplication.apply(preset, verifyVisualSettings: verify) { [weak self] errors in
             guard let self else { return }
             var errors = errors
             let saved = self.presetStore.load(displays: self.displayController.displays(includeModes: false))
@@ -615,8 +664,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             }
             self.applyingPreset = false
             self.presetWindow.setSavingEnabled(true)
-            if errors.isEmpty { UserDefaults.standard.set(slot, forKey: "lastAppliedPreset") }
-            else { UserDefaults.standard.removeObject(forKey: "lastAppliedPreset") }
+            if errors.isEmpty { self.lastPreset = (slot, verify) }
             self.rebuildMenu()
             if !errors.isEmpty { self.showError(errors.joined(separator: "\n")) }
         }
@@ -659,8 +707,43 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func openPresetSettings() {
-        guard !applyingPreset else { return }
+        guard !presetBusy else { return }
         presetWindow.present()
+    }
+    @objc private func openSwitchOptions() {
+        guard !presetBusy else { return }
+        let delay = NSComboBox(frame: .zero)
+        delay.addItems(withObjectValues: ["0", "1", "3", "5", "10", "30", "60"])
+        delay.stringValue = String(startDelay.seconds)
+        delay.setAccessibilityLabel("开始前等待的秒数")
+        delay.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        let row = NSStackView(views: [NSTextField(labelWithString: "开始前等待"), delay,
+                                      NSTextField(labelWithString: "秒")])
+        row.orientation = .horizontal
+        let verify = NSButton(checkboxWithTitle: "智能核验亮度与对比度", target: nil, action: nil)
+        verify.state = verifyVisualSettings ? .on : .off
+        let controls = NSStackView(views: [row, verify])
+        controls.orientation = .vertical
+        controls.alignment = .leading
+        controls.spacing = 10
+        controls.frame = NSRect(x: 0, y: 0, width: 265, height: 62)
+        let alert = NSAlert()
+        alert.messageText = "预设切换设置"
+        alert.informativeText = "延时可设为 0–60 秒，倒计时期间可取消。智能核验会等待读数稳定，仅对连续两次偏离目标的项目补发一次。关闭后，每块屏幕只发送一次设置。"
+        alert.accessoryView = controls
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        alert.window.initialFirstResponder = delay
+        NSApp.activate(ignoringOtherApps: true)
+        while alert.runModal() == .alertFirstButtonReturn {
+            if let seconds = Int(delay.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)),
+               (0...60).contains(seconds) {
+                startDelay.seconds = seconds
+                verifyVisualSettings = verify.state == .on
+                return
+            }
+            alert.informativeText = "请输入 0 到 60 之间的整数秒数。"
+        }
     }
     @objc private func refresh() { rebuildMenu() }
     @objc private func openBetterDisplay() {

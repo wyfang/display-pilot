@@ -15,6 +15,8 @@ A macOS menu bar app for switching an entire multi-display setup with one click.
 
 ## Usage
 
+Open “预设切换设置…” (preset switching settings) in the menu bar to choose a delay of 0–60 seconds. Presets run immediately by default. With a five-second delay, selecting a preset or using its menu shortcut starts a visible countdown that you can cancel from the menu.
+
 ### Requirements
 
 - macOS 13 or later
@@ -39,19 +41,23 @@ Run `./Tests/run.sh` for isolated regression tests or `./scripts/generate-icon.s
 
 Display Pilot turns two common multi-display configurations into single-click menu bar presets. macOS controls display connections, resolution, and rotation. Brightness and contrast use BetterDisplay's notification integration, which shares its CLI protocol.
 
-Switching connects target displays, applies requested rotation and resolution, disconnects unwanted displays, then applies and reads back brightness and contrast after the topology settles. Unavailable rotation or resolution does not block other supported settings; results are reported separately. Final checks cover display identity, connections, requested modes, and visual settings, so partial completion is not marked as complete.
+Switching connects target displays, applies the requested rotation and resolution, and disconnects unwanted displays. If a rotation or resolution is unavailable, other supported settings still run and the app reports the outcome. Once the configuration settles, Display Pilot sends each enabled display one request containing its brightness and software contrast targets.
+
+“智能核验亮度与对比度” (verify brightness and contrast) is on by default under preset switching settings. After sending all requests, Display Pilot waits for BetterDisplay to update and reads each display’s brightness and contrast separately. If a reading differs from the target, Display Pilot waits and checks again. It resends only settings that missed their targets twice, at most once per display. After a correction, it rechecks the displays to catch changes from BetterDisplay’s brightness synchronization. When all checks pass, the menu shows “上次已核验” (last switch verified).
+
+With verification off, Display Pilot sends one settings request per display. The menu shows “已发送” (sent) after BetterDisplay acknowledges the requests and Display Pilot checks display identity, connections, and requested modes.
 
 “Apply resolution and rotation” is independent of brightness: an explicit selection also applies the saved geometry at 0% brightness. Legacy blackout presets without this option default to changing connection, brightness, and contrast only. “Follow current” does not actively change orientation, and upgrading legacy presets does not add a rotation requirement based on the screen's current angle. Existing explicit settings remain unchanged.
 
 Brightness slider edits save whole percentages, so a displayed 0% saves exactly zero. Existing fractional values are preserved, with nonzero values below 1% shown separately. Explicit rotation uses the native macOS interface without BetterDisplay rotation permissions; 90° and 270° are verified separately.
 
-Already-matched connections and display modes skip unnecessary fixed waits while brightness and contrast are still verified. Actual connection changes retain their stabilization waits.
+Already-matched connections and display modes skip the wait for display configuration changes to settle.
 
 ### Limitations
 
 - Display switching uses the private macOS API `CGSConfigureDisplayEnabled`, and rotation uses the system `MonitorPanel` interface; these are unsuitable for Mac App Store distribution and may be affected by system updates
 - Rotation requires support from macOS and the display. Unsupported rotation is reported separately while other available settings continue
-- Missing BetterDisplay, disabled integration, or mismatched readback prevents a preset from being marked successful
+- Display Pilot reports when BetterDisplay is unavailable, rejects a request, or leaves the result unconfirmed. Verification also identifies displays with unreadable values or a final reading outside the target tolerance
 - Physically disconnected displays cannot be reconnected by software; displays with unverified identities cannot be switched
 - Upgrades retain legacy preset data; ambiguous legacy devices must be configured again. Choose an explicit angle when active rotation is needed; the app does not infer direction from resolution
 - Cables, docks, mirroring, HDR, and macOS updates may invalidate saved modes

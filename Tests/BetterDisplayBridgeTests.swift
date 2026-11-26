@@ -43,16 +43,22 @@ struct BetterDisplayBridgeTests {
         }
     }
 
+    private static let sample = VisualValues(brightness: 0.5, contrast: 0)
+    private static let both: Set<VisualField> = [.brightness, .contrast]
+
     static func main() throws {
         precondition(Thread.isMainThread)
         missingDependencyDoesNotSend()
-        responseMustMatchAndReadBack()
+        acknowledgeOneWriteAndVerifyOnRequest()
         rejectionAndMalformedResponsesFail()
         timeoutCompletesOnce()
         simultaneousRequestsRemainIndependent()
-        mismatchRetriesAreBounded()
+        writesOnlyRequestedFields()
+        mismatchesIdentifyOnlyFieldsOutsideTolerance()
+        failedContrastReadDoesNotReturnPartialValues()
+        tinyPositiveBrightnessSurvivesEncoding()
         invalidValuesDoNotSend()
-        print("BetterDisplayBridgeTests: 7 scenarios passed")
+        print("BetterDisplayBridgeTests: 10 scenarios passed")
     }
 
     private static func missingDependencyDoesNotSend() {
@@ -60,21 +66,21 @@ struct BetterDisplayBridgeTests {
         transport.prefix = nil
         let bridge = BetterDisplayBridge(transport: transport)
         var error: String?
-        bridge.setVisualSettings(brightness: 0.5, contrast: 0, displayID: 1) {
+        bridge.setVisualSettings(sample, fields: both, displayID: 1) {
             if case .failure(let failure) = $0 { error = failure.message }
         }
         precondition(error?.contains("未运行") == true)
         precondition(transport.requests.isEmpty)
     }
 
-    private static func responseMustMatchAndReadBack() {
+    private static func acknowledgeOneWriteAndVerifyOnRequest() {
         let transport = FakeTransport()
         transport.prefix = "com.betterdisplay.BetterDisplay"
         let bridge = BetterDisplayBridge(transport: transport)
         var completions = 0
-        bridge.setVisualSettings(brightness: 0.535, contrast: -0.15, displayID: 42) {
+        bridge.setVisualSettings(VisualValues(brightness: 0.535, contrast: -0.15), fields: both, displayID: 42) {
             precondition(Thread.isMainThread)
-            guard case .success = $0 else { preconditionFailure("Expected verified success") }
+            guard case .success = $0 else { preconditionFailure("Expected write acknowledgement") }
             completions += 1
         }
         precondition(completions == 0)
@@ -87,14 +93,20 @@ struct BetterDisplayBridgeTests {
         transport.receive?("{\"uuid\":\"unrelated\",\"result\":true}")
         precondition(transport.requests.count == 1 && completions == 0)
         transport.reply(to: 0, result: true)
-        precondition(completions == 0 && transport.requests.count == 2)
+        precondition(completions == 1 && transport.requests.count == 1 && transport.timers.isEmpty)
+        var verified = false
+        bridge.readVisualSettings(displayID: 42) {
+            guard case .success(let values) = $0 else { preconditionFailure("Expected both values") }
+            precondition(values == VisualValues(brightness: 0.53, contrast: -0.15))
+            verified = true
+        }
         let read = transport.requests[1]["parameters"] as! [String: Any]
         precondition(transport.requests[1]["commands"] as? [String] == ["get"])
         precondition(read["brightness"] is NSNull)
         transport.reply(to: 1, result: true, payload: "0.53\n")
-        precondition(completions == 0 && transport.requests.count == 3)
+        precondition(!verified && transport.requests.count == 3)
         transport.reply(to: 2, result: true, payload: "-0.15")
-        precondition(completions == 1 && transport.timers.isEmpty)
+        precondition(verified && transport.timers.isEmpty)
         transport.reply(to: 2, result: true, payload: "-0.15")
         precondition(completions == 1)
     }
@@ -109,9 +121,9 @@ struct BetterDisplayBridgeTests {
                 if case .failure(let failure) = $0 { error = failure.message; reason = failure.reason }
             }
             if scenario == 5 {
-                bridge.setVisualSettings(brightness: 0.5, contrast: 0, displayID: 1, completion: completion)
+                bridge.setVisualSettings(sample, fields: both, displayID: 1, completion: completion)
             } else {
-                bridge.verifyVisualSettings(brightness: 0.5, contrast: 0, displayID: 1, completion: completion)
+                bridge.readVisualSettings(displayID: 1) { result in completion(result.map { _ in () }) }
             }
             switch scenario {
             case 0: transport.reply(to: 0, result: false, payload: "Feature unavailable")
@@ -121,6 +133,7 @@ struct BetterDisplayBridgeTests {
             default: transport.reply(to: 0, result: false, payload: "Pro required.")
             }
             precondition(error != nil && transport.timers.isEmpty && transport.requests.count == 1)
+            if scenario == 1 { precondition(reason == .unconfirmed) }
             if scenario == 0 { precondition(error!.contains("Feature unavailable")) }
             if scenario >= 4 {
                 precondition(error!.contains("Pro required.") && reason == .requiresPro,
@@ -133,9 +146,9 @@ struct BetterDisplayBridgeTests {
         let transport = FakeTransport()
         let bridge = BetterDisplayBridge(transport: transport, timeout: 0.1)
         var completions = 0
-        bridge.setVisualSettings(brightness: 0.5, contrast: 0, displayID: 1) {
+        bridge.setVisualSettings(sample, fields: both, displayID: 1) {
             guard case .failure(let failure) = $0 else { preconditionFailure("Expected timeout") }
-            precondition(failure.message.contains("超时"))
+            precondition(failure.message.contains("超时") && failure.reason == .unconfirmed)
             completions += 1
         }
         transport.receive?("invalid JSON")
@@ -152,7 +165,7 @@ struct BetterDisplayBridgeTests {
         let bridge = BetterDisplayBridge(transport: transport)
         var finished: [Int] = []
         for display in 1...2 {
-            bridge.verifyVisualSettings(brightness: 0.5, contrast: 0, displayID: UInt32(display)) {
+            bridge.readVisualSettings(displayID: UInt32(display)) {
                 guard case .success = $0 else { preconditionFailure("Expected success") }
                 finished.append(display)
             }
@@ -165,24 +178,64 @@ struct BetterDisplayBridgeTests {
         precondition(finished == [2, 1] && transport.timers.isEmpty)
     }
 
-    private static func mismatchRetriesAreBounded() {
+    private static func writesOnlyRequestedFields() {
+        for fields: Set<VisualField> in [[], [.brightness], [.contrast], both] {
+            let transport = FakeTransport()
+            let bridge = BetterDisplayBridge(transport: transport)
+            var completed = false
+            bridge.setVisualSettings(sample, fields: fields, displayID: 7) {
+                guard case .success = $0 else { preconditionFailure("Expected write success") }
+                completed = true
+            }
+            if fields.isEmpty {
+                precondition(completed && transport.requests.isEmpty)
+                continue
+            }
+            precondition(!completed && transport.requests.count == 1)
+            precondition(transport.requests[0]["commands"] as? [String] == ["set"])
+            let sent = transport.requests[0]["parameters"] as! [String: String]
+            precondition(sent["displayID"] == "7")
+            precondition(sent["brightness"] == (fields.contains(.brightness) ? "0.500" : nil))
+            precondition(sent["contrast"] == (fields.contains(.contrast) ? "0.000" : nil))
+            transport.reply(to: 0, result: true)
+            precondition(completed && transport.requests.count == 1)
+        }
+    }
+
+    private static func mismatchesIdentifyOnlyFieldsOutsideTolerance() {
+        precondition(VisualValues(brightness: 0.49, contrast: 0.001).mismatches(comparedTo: sample).isEmpty)
+        precondition(VisualValues(brightness: 0.48, contrast: 0).mismatches(comparedTo: sample) == [.brightness])
+        precondition(VisualValues(brightness: 0.5, contrast: -0.002).mismatches(comparedTo: sample) == [.contrast])
+        precondition(VisualValues(brightness: 0.48, contrast: -0.002).mismatches(comparedTo: sample) == both)
+        let off = VisualValues(brightness: 0, contrast: 0)
+        let dim = VisualValues(brightness: 0.01, contrast: 0)
+        precondition(off.mismatches(comparedTo: dim) == [.brightness])
+        precondition(dim.mismatches(comparedTo: off) == [.brightness])
+    }
+
+    private static func failedContrastReadDoesNotReturnPartialValues() {
         let transport = FakeTransport()
         let bridge = BetterDisplayBridge(transport: transport)
-        var error: String?
-        bridge.verifyVisualSettings(brightness: 0.5, contrast: 0, displayID: 1) {
-            if case .failure(let failure) = $0 { error = failure.message }
+        var failure: AppFailure?
+        bridge.readVisualSettings(displayID: 3) {
+            if case .failure(let error) = $0 { failure = error }
         }
-        for pass in 0..<3 {
-            transport.reply(to: pass * 2, result: true, payload: "0.8")
-            transport.reply(to: pass * 2 + 1, result: true, payload: "0.2")
-            if pass < 2 {
-                precondition(error == nil)
-                transport.fireTimers(lessThan: 1)
-            }
+        transport.reply(to: 0, result: true, payload: "0.5")
+        let sent = transport.requests[1]["parameters"] as! [String: Any]
+        precondition(sent["contrast"] is NSNull && sent["brightness"] == nil)
+        transport.reply(to: 1, result: true, payload: "nan")
+        precondition(failure?.message.contains("对比度") == true && transport.timers.isEmpty)
+        precondition(transport.requests.count == 2)
+    }
+
+    private static func tinyPositiveBrightnessSurvivesEncoding() {
+        for brightness in [0.0004, 0.00001] {
+            let transport = FakeTransport()
+            let bridge = BetterDisplayBridge(transport: transport)
+            bridge.setVisualSettings(VisualValues(brightness: brightness, contrast: 0), fields: [.brightness], displayID: 1) { _ in }
+            let parameters = transport.requests[0]["parameters"] as! [String: Any]
+            precondition(Double(parameters["brightness"] as! String) == brightness, "never encode a nonzero target as zero")
         }
-        precondition(error?.contains("读回结果不一致") == true)
-        precondition(error?.contains("80.0%") == true)
-        precondition(transport.requests.count == 6 && transport.timers.isEmpty)
     }
 
     private static func invalidValuesDoNotSend() {
@@ -190,7 +243,7 @@ struct BetterDisplayBridgeTests {
         let bridge = BetterDisplayBridge(transport: transport)
         for values in [(Double.nan, 0.0), (0.5, Double.infinity), (1.1, 0.0), (0.5, -1.0)] {
             var failed = false
-            bridge.setVisualSettings(brightness: values.0, contrast: values.1, displayID: 1) {
+            bridge.setVisualSettings(VisualValues(brightness: values.0, contrast: values.1), fields: both, displayID: 1) {
                 if case .failure = $0 { failed = true }
             }
             precondition(failed)
